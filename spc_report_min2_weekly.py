@@ -27,11 +27,33 @@
 # 23  診断print(窓内点数の分布・ゲート未達件数・各ルールの点数到達率)
 # 24  メール件名を「NG率レポート（トピックス付き・自動配信）」に変更
 # ================================================================================
+# 【二重計上対策 改修（annotated1 → 本版）】「▲修正N」で検索。「#▲旧|」が改修前の原文。
+#  ■背景：データ抽出がロット単位のため、工程Cのロットを先週分で引くと、その同じロットが
+#    　　　通過した工程A/Bの「先々週以前」の行まで一緒にテーブルへ入ってくる。
+#    　　　旧実装のNG率窓は「そのchの最新加工日時から8日」という“ch相対”の窓だったので、
+#    　　　最新が先々週のchでは窓が先々週側にスライドし、＝先週すでに配信した行をもう一度数える。
+#    　　　結果、悪化幅トップ(差分)からは「差分ゼロ」で落ちるのに、NG率トップ(絶対値)には
+#    　　　先週と全く同じ内容が毎週上がり続ける。
+#  ■方針：期間を“時計”で切るのをやめ、「前回配信以降に新しく入った加工日時の行だけを数える」
+#    　　　＝キー単位の水位線(watermark)方式に変更する。既報行は何度テーブルに現れても数えない。
+#  1  実行基準時刻 jd を導入（DateTime.Now を全体で1回だけ取得）
+#  2  状態文字列に6番目「前回集計済みの最終加工日時(ticks)」を追加（ja=読取 / jc=前回水位線）
+#  3  NG率集計を「ch最新から8日」→「前回配信以降の新規行のみ」へ（初登場chは全期間）
+#  4  停止ch判定(ic/ie)を廃止。新規行が無いchは“0”ではなく“非掲載”にする
+#  5  判定値の表記ゆれ(前後空白/全角)を吸収＋OK/NG以外の値の件数を診断出力
+#  6  ルール判定窓を「ch最新から30日」→「実行時刻から30日」（本文の仕様どおり自然に消える）
+#  7  状態は上書きではなくマージ保存（新規行が無いkeyの水位線・継続回数・前回値を失わない）
+#  8  画像の描画対象を jo に一本化／トレリス頁名→ch の解決を正規化マッチ化
+#  9  画像ラベル・本文・詳細HTML・完了ログの期間表記を新仕様に差替
+# 10  診断print（既報スキップ件数／未知判定値／掲載ch数 ほか）
+# ================================================================================
 # SPC NG率レポート 自動配信（最短化版）。動作は spc_report_integrated.py と同一。
 #===== ★変更1 ここから ===== ヘッダの期間説明を新仕様(NG率8日/ルール30日/画像全期間)に差替
 #★旧| # 集計期間：既存装置ch=最新加工日時から直近PERIOD_DAYS日／初回=全期間。管理線は全体計算前提。
-# 期間（週次実行前提）：NG率等=chの最新加工日時から直近n日(=8)／初登場ch・停止ch(最新が窓より古い)=全期間。   #★変更1
-# 　　　　　　　　　　ルール判定=chの最新加工日時から直近ia日(=30)、全ルール一律・ゲートu点(=8)。画像=全期間表示。   #★変更1
+#★旧| # 期間（週次実行前提）：NG率等=chの最新加工日時から直近n日(=8)／初登場ch・停止ch(最新が窓より古い)=全期間。
+#★旧| # 　　　　　　　　　　ルール判定=chの最新加工日時から直近ia日(=30)、全ルール一律・ゲートu点(=8)。画像=全期間表示。
+# 期間（週次実行前提）：NG率等=前回配信以降に追加された加工日時の行のみ／初登場ch=全期間。   #▲修正9
+# 　　　　　　　　　　ルール判定=実行時刻から直近ia日(=30)、全ルール一律・ゲートu点(=8)。画像=全期間表示。   #▲修正9
 #===== ★変更1 ここまで =====
 # ============ 変数辞書（自動生成・改名は挙動不変）★=会社で実値に要設定 ============
 # 記法: 短縮名 = 意味  [元の名前]。'汎用'はスコープ違いで同名を使い回している一時変数。
@@ -48,7 +70,7 @@
 # k   = σ係数プロパティ名(SIGMA_K)
 # l   = 移動平均Nプロパティ名(MA_N)
 # m   = 加工日時列名 ★
-# n   = 集計期間(日) PERIOD_DAYS
+# n   = 集計期間(日) PERIOD_DAYS ※本版では「水位線が無い既存key」の移行用フォールバック窓
 # o   = 実測値列名 ★
 # p   = 中心線列名 ★
 # q   = σ列名(σ_LOT)
@@ -165,12 +187,13 @@
 # dz  = 生成画像数 [nimg]
 # ea  = 差分スキップ数 [nskip]
 # eb  = 画像記録(率,項目,ch,OK,NG,path,fn) [ur]
-# ec  = 集計区分 key→「直近n日/全期間」 [us]
+# ec  = 集計区分 key→「前回以降/初回(全期間)/移行」 [us]
 # ed  = ルール検出結果 key→{種類:程度} [rh]
 # ee  = 現在の監視項目 [it]
 # ef  = 今回σ係数 [k_now]
 # eg  = 今回移動平均N [n_now]
-# eh  = 装置ch→最新加工日時 [lt]
+# eh  = 装置ch→「判定のある行」の最新加工日時（診断用）
+# eh0 = 装置ch→全行の最新加工日時（トレリス頁の母集合用）   #▲修正3
 # ei  = 行イテレータ(値未使用) [r]
 # ej  = 汎用:装置ch値/レコード [u]
 # ek  = 項目内NG数 [ng]
@@ -178,8 +201,8 @@
 # em  = 装置ch→NG数 [ung]
 # en  = 装置ch→OK数 [uok]
 # eo  = 合成キー 項目\x1f装置ch [key]
-# ep  = 対象chの最新日時 [lu]
-# eq  = 出現した装置ch集合 [allu]
+# ep  = 汎用の一時日時 [lu]
+# eq  = 今回集計できた装置ch集合 [allu]
 # er  = 装置ch [u2]
 # es  = ロット単位集計フラグ [is_lot]
 # et  = 集計用カーソル一覧 [rc]
@@ -278,8 +301,8 @@
 # --- 週次化(2026-07)で追加 ---   #★追加2
 # ia  = ルール判定窓(日)=30   #★追加2
 # ib  = ルール判定窓のTimeSpan   #★追加2
-# ic  = 項目内の最新加工日時（停止ch判定の基準点）   #★追加2
-# ie  = 停止ch集合（最新がNG率窓より古い→全期間集計）   #★追加2
+#★旧| # ic  = 項目内の最新加工日時（停止ch判定の基準点）   ←▲修正4で廃止
+#★旧| # ie  = 停止ch集合（最新がNG率窓より古い→全期間集計）  ←▲修正4で廃止
 # ii  = 診断:ルール判定系列の窓内点数リスト   #★追加2
 # ig  = 前回のルール継続回数 key→{ruleidx:回数}   #★追加2
 # ih  = 今回のルール継続回数 key→{ruleidx:回数}   #★追加2
@@ -287,6 +310,22 @@
 # ik  = ルール名→インデックス（表示順doに基づく）   #★追加2
 # im  = 関数 表示用「新規／継続N回目」   #★追加2
 #===== ★追加2 ここまで =====
+# --- 二重計上対策(本版)で追加 ---   #▲修正1
+# jd  = 実行基準時刻（DateTime.Now を1回だけ取得して全体で共有）   #▲修正1
+# jb  = 既報除外(水位線)の有効フラグ。Falseで旧来の“実行時刻からn日”窓に退避   #▲修正3
+# ja  = 関数 状態6番目フィールド→前回集計済みの最終加工日時(DateTime|None)   #▲修正2
+# jc  = key→前回集計済みの最終加工日時（＝水位線。これ以前の行は二度と数えない）   #▲修正2
+# jm  = key→今回“数えた”行の最新加工日時（次回の水位線として保存）   #▲修正2
+# jl  = key→今回の新規判定行数（0なら非掲載）   #▲修正3
+# jn  = 保存用のマージ後状態辞書   #▲修正7
+# jo  = 画像描画の対象ch集合（今回集計あり ∪ ルール検出あり）   #▲修正8
+# jz  = 正規化ch名→実ch名（トレリス頁名の解決用）   #▲修正8
+# jr  = 診断カウンタ辞書(skip=既報スキップ/old=移行窓スキップ/unk=未知判定値)   #▲修正10
+# jy  = 関数 保存用の状態文字列を7フィールドで組み立てる   #▲修正7
+# jk  = 汎用:このkeyの水位線   #▲修正3
+# jx  = 前回の配信で実際に掲載されたkey集合（前回サマリの母集合）   #▲修正7
+# ji/je/jj = 診断:既報スキップ/移行窓スキップ/未知判定値（項目内カウンタ）   #▲修正10
+# 状態フィールド: OK;NG;係数;MA;継続回数;水位線ticks;更新した実行時刻ticks   #▲修正2/7
 # ================================================================================
 import clr
 clr.AddReference('System.Drawing'); clr.AddReference('System.IO.Compression'); clr.AddReference('System.IO.Compression.FileSystem')
@@ -295,7 +334,8 @@ from System.Drawing.Imaging import ImageFormat,Encoder,EncoderParameter,EncoderP
 from System.IO import Directory,Path,File,StreamWriter
 from System.IO.Compression import ZipFile
 from System.Text import Encoding
-from System import String,DateTime,TimeSpan,Double
+#★旧| from System import String,DateTime,TimeSpan,Double
+from System import String,DateTime,TimeSpan,Double,Int64   # Int64=水位線(ticks)の復元用   #▲修正2
 from System.Threading import Thread
 from Spotfire.Dxp.Application.Visuals import VisualContent
 from Spotfire.Dxp.Data import DataValueCursor,DataPropertyClass
@@ -311,7 +351,7 @@ f="データ"; g="＜判定列名＞"; h="004_Gr_1"; i="項目1"; j="＜グラ�
 k="SIGMA_K"; l="MA_N"
 #===== ★変更3 ここから ===== n=7→n=8(NG率窓)、ia=30(ルール判定窓)を新設
 #★旧| m="＜加工日時列名＞"; n=7
-m="＜加工日時列名＞"; n=8; ia=30   # n=NG率窓(日) / ia=ルール判定窓(日)   #★変更3
+m="＜加工日時列名＞"; n=8; ia=30   # n=移行用フォールバック窓(日) / ia=ルール判定窓(日)   #★変更3 #▲修正3
 #===== ★変更3 ここまで =====
 o="＜実測値列名＞"; p="＜中心線列名＞"; q="σ_LOT"; r="＜ロットID列名＞"
 s="lot"; t=[]   # 例外に挙げた項目だけ既定と逆の単位
@@ -324,10 +364,15 @@ ai=0.0
 aj=True; ak=True; al=False; am=True
 an=False; ao=False
 ap=r"C:\Users\＜自分＞\Desktop\spc_test"; aq="SPC_PrevState"
+#===== ▲修正1 ここから ===== 実行基準時刻を1回だけ取得（以降の期間判定は全てこれを基準にする）
+jd=DateTime.Now   # 実行基準時刻。ch相対ではなくこの時刻を基準にすることで期間が毎回同じ意味になる   #▲修正1
+jb=True           # True=既報行を水位線で除外（推奨） / False=旧来型の“実行時刻からn日”窓に退避   #▲修正3
+#===== ▲修正1 ここまで =====
 
 ar=ap if aj else Path.GetTempPath()
 if not Directory.Exists(ar): Directory.CreateDirectory(ar)
-at=d(ar,"run_"+DateTime.Now.ToString("yyyyMMdd_HHmmss"))
+#★旧| at=d(ar,"run_"+DateTime.Now.ToString("yyyyMMdd_HHmmss"))
+at=d(ar,"run_"+jd.ToString("yyyyMMdd_HHmmss"))   #▲修正1
 au=d(at,"img"); Directory.CreateDirectory(au)
 
 av=b.Tables[f]
@@ -353,7 +398,7 @@ def aw():
     print "経路A・B不可→手動代入"; return None
 be=aw()
 if not be:
-    be=["工程A|膜厚|STEP","工程A|Rs|STEP","工程B|CD|STEP"]   # ←実項目名に置換
+    be=[u"工程A|膜厚|STEP",u"工程A|Rs|STEP",u"工程B|CD|STEP"]   # ←実項目名に置換（キー生成がunicode前提のためu""必須）   #▲修正8
     print "items手動:",len(be)
 
 bf=[az.As[VisualContent]() for bg in Document.Pages for az in bg.Visuals if az.Title==j][0]
@@ -372,6 +417,9 @@ def bs(bt):
 def bv(bw,bx):
     by=bw+bx; return (100.0*bx/by) if by else 0.0   # BUG?: tt=0でゼロ割回避
 bz=lambda ay,ca:u"%s\x1f%s"%(ay,ca); cb=lambda cc:cc.split(u"\x1f",1); cd=lambda ba:ba[0]; ce=u'<p>該当なし</p>'   # キー生成/分解・ソートキー・該当なし
+#===== ▲修正8 ここから ===== 表記ゆれ吸収キーの定義を前倒し（トレリス頁名の解決でも使うため）
+def jv(cc): return cc.replace(u" ",u"").replace(u"\u3000",u"").replace(u"-",u"").replace(u"_",u"").lower()   # 表記ゆれ吸収キー   #▲修正8
+#===== ▲修正8 ここまで =====
 
 import math
 
@@ -435,7 +483,7 @@ do=[cf,cg,ch,ci,cj,ck,cl]
 dp=[dq for dq in ImageCodecInfo.GetImageEncoders() if dq.FormatID==ImageFormat.Jpeg.Guid][0]
 dr=EncoderParameters(1); dr.Param[0]=EncoderParameter(Encoder.Quality,y)
 
-ds={}   # 前回状態 prev[key]="OK;NG;係数;MA"
+ds={}   # 前回状態 prev[key]="OK;NG;係数;MA;継続回数;水位線ticks;更新した実行時刻ticks"   #▲修正2/7
 try:
     dt=a[aq]
     if dt:
@@ -444,12 +492,33 @@ try:
 except: ds={}
 if aj and an: ds={u"工程A|膜厚|STEP\x1f装置Ach1":u"40;2;3.0;30"}; print "TEST前回固定"
 dv={}
+#===== ▲修正2 ここから ===== 状態の6番目「水位線」7番目「更新した実行時刻」を読み出す
+def ja(bt,db=5):   # 状態文字列のdb番目(ticks)→DateTime。無い/壊れている場合はNone   #▲修正2
+    try:
+        bu=bt.split(u";")
+        if len(bu)>db and bu[db].strip(): return DateTime(Int64.Parse(bu[db].strip()))
+    except: pass
+    return None
+jc={}   # key→水位線。これ以前の加工日時の行は「既に配信済み」として二度と数えない   #▲修正2
+ep=None
+for cc in ds:
+    dc=ja(ds[cc],5)
+    if dc is not None: jc[cc]=dc
+    dc=ja(ds[cc],6)
+    if dc is not None and (ep is None or dc>ep): ep=dc   # 状態中の最大＝前回の実行時刻
+# 前回サマリ(全体NG率・NGありch数)の母集合。状態をマージ保存するようにしたため、   #▲修正7
+# 「ds全件」ではなく「前回の配信で実際に掲載されたkey」だけを前回値として扱う。
+jx=set(cc for cc in ds if ja(ds[cc],6)==ep) if ep is not None else set(ds)   #▲修正7
+jm={}; jl={}   # jm=今回数えた最新加工日時(次回の水位線) / jl=今回の新規判定行数   #▲修正2
+jr={"skip":0,"old":0,"unk":0}   # 診断カウンタ   #▲修正10
+print "DBG 前回状態=%d件 / 水位線あり=%d件 / 前回掲載=%d件 (%s)"%(len(ds),len(jc),len(jx),u"通常運転" if jc else u"初回or移行回")   #▲修正10
+#===== ▲修正2 ここまで =====
 
 #===== ★変更5 ここから ===== 診断用リスト ii=[] を追加／ib(30日TimeSpan)を新設
 #★旧| dw=[]; dx=[]; dy=[]; dz=0; ea=0; eb=[]; ec={}; ed={}; jw=[]   # rows=(項目,NG,母数,率)/rh=key→{種類:程度}/us=集計/ur=画像
 #★旧| di=TimeSpan(n,0,0,0)
 dw=[]; dx=[]; dy=[]; dz=0; ea=0; eb=[]; ec={}; ed={}; jw=[]; ii=[]   # rows=(項目,NG,母数,率)/rh=key→{種類:程度}/us=集計/ur=画像   #★変更5
-di=TimeSpan(n,0,0,0); ib=TimeSpan(ia,0,0,0)   # di=NG率窓 / ib=ルール判定窓   #★変更5
+di=TimeSpan(n,0,0,0); ib=TimeSpan(ia,0,0,0)   # di=移行用フォールバック窓 / ib=ルール判定窓   #★変更5 #▲修正3
 #===== ★変更5 ここまで =====
 try: jq=a[i]        # 実行前の項目選択を退避
 except: jq=None
@@ -460,33 +529,58 @@ for ee in be:
         except: ef=u"?"
         try: eg=a[l]
         except: eg=u"?"
-        eh={}
-        for ei in av.GetRows(bi,bj):
-            ej=bi.CurrentValue; dc=bj.CurrentValue
-            if ej in (None,"") or dc is None: continue
-            if ej not in eh or dc>eh[ej]: eh[ej]=dc
-#===== ★追加6 ここから ===== ic=項目内の最新加工日時／ie=停止ch集合(C案)の算出
-        ic=None   # 項目内の最新加工日時＝停止判定の基準点   #★追加6
-        for er in eh:   #★追加6
-            if ic is None or eh[er]>ic: ic=eh[er]   #★追加6
-        ie=set(er for er in eh if ic is not None and eh[er]<ic.Subtract(di))   # C案:最新が窓より古いch=停止ch→全期間   #★追加6
-#===== ★追加6 ここまで =====
-        ek=el=0; em={}; en={}
+#===== ▲修正3 ここから ===== 基準日時の作成（集計の窓には使わない。診断と頁母集合のためだけ）
+#★旧|         eh={}
+#★旧|         for ei in av.GetRows(bi,bj):
+#★旧|             ej=bi.CurrentValue; dc=bj.CurrentValue
+#★旧|             if ej in (None,"") or dc is None: continue
+#★旧|             if ej not in eh or dc>eh[ej]: eh[ej]=dc
+        eh={}; eh0={}   # eh=判定のある行の最新(診断用) / eh0=全行の最新(トレリス頁の母集合)   #▲修正3
         for ei in av.GetRows(bh,bi,bj):
             ej=bi.CurrentValue; dc=bj.CurrentValue
             if ej in (None,"") or dc is None: continue
+            if ej not in eh0 or dc>eh0[ej]: eh0[ej]=dc
+            if bh.CurrentValue not in (None,""):
+                if ej not in eh or dc>eh[ej]: eh[ej]=dc
+#===== ▲修正3 ここまで =====
+#===== ★追加6 ここから ===== ic=項目内の最新加工日時／ie=停止ch集合(C案)の算出
+#★旧|         ic=None   # 項目内の最新加工日時＝停止判定の基準点
+#★旧|         for er in eh:
+#★旧|             if ic is None or eh[er]>ic: ic=eh[er]
+#★旧|         ie=set(er for er in eh if ic is not None and eh[er]<ic.Subtract(di))   # C案:最新が窓より古いch=停止ch→全期間
+# ▲修正4: 停止ch(ic/ie)の概念を廃止。ch相対の窓をやめたので「止まっているch」は
+#          “全期間で数え直す対象”ではなく“今回は新規行が無い＝非掲載”として自然に落ちる。
+#===== ★追加6 ここまで =====
+#===== ▲修正3/5 ここから ===== NG率集計を「前回配信以降の新規行だけ」に変更＋判定値の表記ゆれ吸収
+        ek=el=0; em={}; en={}
+        ji=0; je=0; jj=0   # 診断:既報スキップ / 移行窓スキップ / 未知判定値   #▲修正10
+        for ei in av.GetRows(bh,bi,bj):
+            ej=bi.CurrentValue; dc=bj.CurrentValue
+            if ej in (None,"") or dc is None: continue
+            if dc>jd: continue                          # 未来日時(誤登録・時刻ズレ)は今回対象外   #▲修正3
             eo=bz(ee,ej)
-#===== ★変更7 ここから ===== NG率窓の適用条件に「かつ停止chでない」を追加
 #★旧|             if eo in ds:
-            if eo in ds and ej not in ie:   # 既存ch かつ 停止chでない→窓を適用   #★変更7
-#===== ★変更7 ここまで =====
-                ep=eh.get(ej,None)
-                if ep is None or dc<ep.Subtract(di): continue
+#★旧|                 ep=eh.get(ej,None)
+#★旧|                 if ep is None or dc<ep.Subtract(di): continue      ←ch相対の窓＝二重計上の原因
+            jk=jc.get(eo)
+            if jb and jk is not None:
+                if dc<=jk: ji+=1; continue              # ★既報行：ロット遡及で再取得されても数えない   #▲修正3
+            elif eo in ds:
+                if dc<jd.Subtract(di): je+=1; continue  # 水位線が無い既存key＝移行回。実行時刻からn日   #▲修正3
+            # 上記いずれにも当たらない＝初登場key → 全期間（従来どおり）
             az=bh.CurrentValue
             if az in (None,""): continue
+            az=unicode(az).strip().upper()              # 前後空白・大小文字の揺れを吸収   #▲修正5
+            if   az in (u"NG",u"ＮＧ",u"×",u"NG判定"): az=u"NG"
+            elif az in (u"OK",u"ＯＫ",u"○",u"◯",u"OK判定"): az=u"OK"
+            else: jj+=1; continue                       # OK/NGどちらでもない値は数えず件数だけ記録   #▲修正5
             el+=1
-            if az=="NG": ek+=1; em[ej]=em.get(ej,0)+1
-            elif az=="OK": en[ej]=en.get(ej,0)+1   # BUG?: OK実値が"OK"でないと未計上
+            if az==u"NG": ek+=1; em[ej]=em.get(ej,0)+1
+            else: en[ej]=en.get(ej,0)+1
+            if eo not in jm or dc>jm[eo]: jm[eo]=dc      # 水位線は“実際に数えた行”だけで進める   #▲修正3
+            jl[eo]=jl.get(eo,0)+1
+        jr["skip"]+=ji; jr["old"]+=je; jr["unk"]+=jj
+#===== ▲修正3/5 ここまで =====
         jt=set(er for er in (set(en)|set(em)) if en.get(er,0)==0 and em.get(er,0)>0)   # OK皆無かつNGありのchは全集計・画像から除外
         for er in jt: ek-=em.get(er,0); el-=em.get(er,0)   # 項目のNG率からも取り除く
         dw.append((ee,ek,el,100.0*ek/el if el else 0))
@@ -494,10 +588,12 @@ for ee in be:
         for er in eq:
             eo=bz(ee,er)
             dv[eo]=u"%d;%d;%s;%s"%(en.get(er,0),em.get(er,0),ef,eg)
-#===== ★変更8 ここから ===== 集計区分ラベル判定に停止chを反映([全期間]表示)
+#===== ★変更8 ここから ===== 集計区分ラベル判定
 #★旧|             ec[eo]=(u"直近%d日"%n) if eo in ds else u"全期間"
-            ec[eo]=(u"直近%d日"%n) if (eo in ds and er not in ie) else u"全期間"   #★変更8
+#★旧|             ec[eo]=(u"直近%d日"%n) if (eo in ds and er not in ie) else u"全期間"
+            ec[eo]=u"前回以降" if eo in jc else ((u"移行(直近%d日)"%n) if eo in ds else u"初回(全期間)")   #▲修正9
 #===== ★変更8 ここまで =====
+        print "DBG %s: 新規判定行=%d / 既報スキップ=%d / 移行窓スキップ=%d / 未知判定値=%d / 掲載ch=%d(除外%d) / 判定ありch=%d(全ch=%d)"%(ee,el,ji,je,jj,len(eq),len(jt),len(eh),len(eh0))   #▲修正10
         es=(ee not in t) if s=="lot" else (ee in t)
         et=[bi,bj,bk,bl,bm,bn]; eu={}; ev={}
         if es:
@@ -506,8 +602,9 @@ for ee in be:
                 er=bi.CurrentValue; dc=bj.CurrentValue
                 if er in (None,"") or dc is None: continue
 #===== ★追加9 ここから ===== ルール判定窓30日フィルタ(ロット単位の系列収集)
-                ep=eh.get(er,None)   #★追加9
-                if ep is not None and dc<ep.Subtract(ib): continue   # ルール判定窓:chの最新加工日時から30日   #★追加9
+#★旧|                 ep=eh.get(er,None)
+#★旧|                 if ep is not None and dc<ep.Subtract(ib): continue   # ch相対の30日窓
+                if dc>jd or dc<jd.Subtract(ib): continue   # ルール判定窓:実行時刻から30日(絶対窓)   #▲修正6
 #===== ★追加9 ここまで =====
                 cv=bk.CurrentValue; ex=bl.CurrentValue; ey=bm.CurrentValue; ez=bn.CurrentValue
                 if cv is None or ex is None or ez in (None,""): continue
@@ -523,12 +620,14 @@ for ee in be:
                 er=bi.CurrentValue; dc=bj.CurrentValue
                 if er in (None,"") or dc is None: continue
 #===== ★追加10 ここから ===== ルール判定窓30日フィルタ(ウエハ単位の系列収集)
-                ep=eh.get(er,None)   #★追加10
-                if ep is not None and dc<ep.Subtract(ib): continue   # ルール判定窓:chの最新加工日時から30日   #★追加10
+#★旧|                 ep=eh.get(er,None)
+#★旧|                 if ep is not None and dc<ep.Subtract(ib): continue
+                if dc>jd or dc<jd.Subtract(ib): continue   # ルール判定窓:実行時刻から30日(絶対窓)   #▲修正6
 #===== ★追加10 ここまで =====
                 cv=bk.CurrentValue; ex=bl.CurrentValue; ey=bm.CurrentValue
                 if cv is None or ex is None: continue
                 eu.setdefault(er,[]).append((dc,cv,ex,ey))
+        jo=set(eq)   # 描画対象ch＝今回集計あり ∪ ルール検出あり（下のループで追加）   #▲修正8
         for er,fb in eu.items():
             if er in jt: continue   # 除外ch（OK皆無かつNGあり）はルール判定もしない
             fb.sort(key=cd)
@@ -543,9 +642,13 @@ for ee in be:
                 if len(fe)>=u: fc.update(cp(fe,True,False))
             else:
                 fc=cp(cq,True,True) if len(cq)>=u else {}
-            if fc: ed[bz(ee,er)]=fc
-        if eq:
-            ff=sorted(eh,key=lambda bp:(bp.replace(u"-",u"").replace(u"_",u"").replace(u" ",u"").lower(),bp))   # この項目の全ch(期間フィルタ前)=トレリス頁の母集合
+            if fc: ed[bz(ee,er)]=fc; jo.add(er)   # 集計は無くても検出があるchは撮る   #▲修正8
+#===== ▲修正8 ここから ===== 描画対象を jo に一本化（集計あり ∪ ルール検出あり）
+        if jo:
+#★旧|         if eq:
+            ff=sorted(eh0,key=lambda bp:(bp.replace(u"-",u"").replace(u"_",u"").replace(u" ",u"").lower(),bp))   # この項目の全ch=トレリス頁の母集合   #▲修正3
+            jz={}
+            for er in eh0: jz[jv(er)]=er   # 正規化ch名→実ch名（頁名の表記ゆれ吸収）   #▲修正8
             fh=[]; fi=bf.Trellis; fj=fi.PageCount or 1
             if fj!=len(ff): print "WARN 項目%s: トレリス頁数%d != 項目内ch数%d（頁が無いchは撮影不可）"%(ee,fj,len(ff))
             try: jp=fi.ActivePageIndex   # 実行前のトレリス表示頁を退避
@@ -556,13 +659,20 @@ for ee in be:
                 except:
                     try: js=unicode(fi.Pages[fk].Name)
                     except: js=None
-                fl=js if (js is not None and js in eq) else (ff[fk] if fk<len(ff) else None)
-                if ak and (fl is None or (fl not in eq and bz(ee,fl) not in ed)): continue   # NG集計対象 or ルール検出chは描画
+#★旧|                 fl=js if (js is not None and js in eq) else (ff[fk] if fk<len(ff) else None)
+                fl=None
+                if js is not None: fl=js if js in eh0 else jz.get(jv(js))   # 掲載対象外のchも含め全chで解決   #▲修正8
+                if fl is None:
+                    fl=ff[fk] if fk<len(ff) else None
+                    print "WARN 頁名でch解決不可→位置で代用: 項目%s 頁%d(%r)"%(ee,fk,js)
+#★旧|                 if ak and (fl is None or (fl not in eq and bz(ee,fl) not in ed)): continue
+                if ak and (fl is None or fl not in jo): continue   # 集計対象 or ルール検出chだけ描画   #▲修正8
+#===== ▲修正8 ここまで =====
                 if ak and al:
                     eo=bz(ee,fl)
 #===== ★変更12 ここから ===== 差分スキップ比較を先頭4フィールドに限定(状態5フィールド化に伴う回帰修正)
 #★旧|                     if ds.get(eo)==dv.get(eo): ea+=1; continue
-                    if u";".join((ds.get(eo) or u"").split(u";")[:4])==dv.get(eo): ea+=1; continue   # 5番目(継続回数)は比較対象外   #★変更12
+                    if u";".join((ds.get(eo) or u"").split(u";")[:4])==dv.get(eo): ea+=1; continue   # 5番目以降(継続回数/水位線)は比較対象外   #★変更12
 #===== ★変更12 ここまで =====
                 fm=fl if fl is not None else u"page %d"%(fk+1)
                 try:   # 1chの失敗で残chを巻き込まない
@@ -575,15 +685,20 @@ for ee in be:
                 except Exception as bb:
                     dy.append(u"%s/%s(描画): %s"%(ee,fm,bb)); continue
                 if fl is not None:
-                    fp=en.get(fl,0); fq=em.get(fl,0); fr=bv(fp,fq); eo=bz(ee,fl)
-                    fs=u'%s ／ %s ／ <span style="color:green">OK %d</span> ・ <span style="color:#c0392b">NG %d</span> ・ 母数 %d ／ NG率 %.2f%% ／ <span style="color:#888">[%s]</span>'%(bo(ee),bo(fm),fp,fq,fp+fq,fr,ec.get(eo,u"全期間"))
+                    eo=bz(ee,fl); fp=en.get(fl,0); fq=em.get(fl,0); fr=bv(fp,fq)
+#===== ▲修正9 ここから ===== 新規データが無いchのラベルを「OK 0・NG 0」ではなく明示表記に
+                    if jl.get(eo,0)>0:
+                        fs=u'%s ／ %s ／ <span style="color:green">OK %d</span> ・ <span style="color:#c0392b">NG %d</span> ・ 母数 %d ／ NG率 %.2f%% ／ <span style="color:#888">[%s]</span>'%(bo(ee),bo(fm),fp,fq,fp+fq,fr,ec.get(eo,u"初回(全期間)"))
+                    else:
+                        fs=u'%s ／ %s ／ <span style="color:#888">今回の新規データなし（推移パターン検出のため掲載／グラフは全期間表示）</span>'%(bo(ee),bo(fm))
+#===== ▲修正9 ここまで =====
                     eb.append((fr,ee,fl,fp,fq,d(au,fo),fo))
                 else: fs=u"%s ／ %s"%(bo(ee),bo(fm))
                 fh.append(u'<p class="lbl">%s</p><img src="img/%s"/>'%(fs,bo(fo)))
             if jp is not None:   # 実行後にトレリス表示頁を元へ戻す
                 try: fi.ActivePageIndex=jp
                 except: pass
-            for er in eq:        # 画像が撮れなかったchを記録（頁数不足の検知）
+            for er in jo:        # 画像が撮れなかったchを記録（頁数不足の検知）
                 if not [1 for ba in eb if ba[1]==ee and ba[2]==er]: jw.append(bz(ee,er))
             if fh: dx.append(u'<section><h2>%s</h2><p class="m">NG %d / %d ＝ %.2f%%</p>%s</section>'%(bo(ee),ek,el,dw[-1][3],u"".join(fh)))
     except Exception as bb: dy.append(u"%s: %s"%(ee,bb))
@@ -607,22 +722,46 @@ def ij(bt):   # 状態文字列の5番目「idx:回数,...」を辞書に   #★
 ig={}   #★追加13
 for cc in ds: ig[cc]=ij(ds[cc])   # 前回の継続回数   #★追加13
 ih={}   #★追加13
-for cc in dv:   #★追加13
+#★旧| for cc in dv:
+for cc in (set(dv)|set(ed)|set(ds)):   # 今回集計が無くても検出があるkeyの継続回数を進める   #▲修正7
     fy=ed.get(cc,{}); ax=ig.get(cc,{}); bd={}   #★追加13
     for gq in fy:   #★追加13
         if gq in ik: bd[ik[gq]]=ax.get(ik[gq],0)+1   # 前回も出ていれば+1、無ければ1(=新規)   #★追加13
     ih[cc]=bd   #★追加13
-    dv[cc]=dv[cc]+u";"+(u",".join(u"%d:%d"%(db,bd[db]) for db in sorted(bd)) if bd else u"")   #★追加13
+#★旧|     dv[cc]=dv[cc]+u";"+(u",".join(u"%d:%d"%(db,bd[db]) for db in sorted(bd)) if bd else u"")
+#  ▲修正7: dvは「今回の集計値(4フィールド)」のまま保持し、保存用の文字列は jy() で組み立てる。
+#          こうしないと dv を参照する後段（bs/悪化/改善）と保存形式が絡んで壊れやすい。
 def im(cc,gq):   # 表示用「新規／継続N回目」   #★追加13
     db=ih.get(cc,{}).get(ik.get(gq,-1),1)   #★追加13
     return u"新規" if db<=1 else u"継続%d回目"%db   #★追加13
    #★追加13
 #===== ★追加13 ここまで =====
+#===== ▲修正7 ここから ===== 状態は「上書き」ではなく「マージ」保存
+# 旧実装は dv（今回集計できたkeyだけ）で丸ごと上書きしていたため、
+#   ・今回新規データが無かったkeyの水位線・継続回数・前回値が消える
+#   ・翌週そのkeyが「初登場」に戻り、全期間集計で先週と同じ数字が再浮上する
+# という失敗/成功が隔週で入れ替わる挙動になっていた。ここでマージして持ち越す。
+def jy(cc):   # 保存用の状態文字列 "OK;NG;係数;MA;継続回数;水位線ticks;更新した実行時刻ticks"   #▲修正7
+    bu=(jn.get(cc) or u"").split(u";")
+    while len(bu)<7: bu.append(u"")
+    if cc in dv:
+        bu2=dv[cc].split(u";")
+        bu[0],bu[1],bu[2],bu[3]=bu2[0],bu2[1],bu2[2],bu2[3]   # 今回集計できたkeyだけ数値を更新
+        bu[6]=u"%d"%jd.Ticks                                  # 今回の配信で掲載したkeyの印
+    bd=ih.get(cc,{})
+    bu[4]=u",".join(u"%d:%d"%(db,bd[db]) for db in sorted(bd)) if bd else u""
+    if cc in jm: bu[5]=u"%d"%jm[cc].Ticks                     # 水位線は今回数えた最新加工日時へ前進
+    return u";".join(bu[:7])
+jn=dict(ds)
+for cc in (set(ds)|set(dv)): jn[cc]=jy(cc)
 if not (aj and ao):
-    a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in dv.items())
+#★旧|     a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in dv.items())
+    a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in jn.items())   #▲修正7
+    print "DBG 状態保存=%d件（今回更新%d件 / 持ち越し%d件）"%(len(jn),len(dv),len(jn)-len(dv))   #▲修正10
+#===== ▲修正7 ここまで =====
 
 ft={}; ju={}
-def jv(cc): return cc.replace(u" ",u"").replace(u"\u3000",u"").replace(u"-",u"").replace(u"_",u"").lower()   # 表記ゆれ吸収キー
+#★旧| def jv(cc): ...   ←▲修正8で定義を前倒し（トレリス頁名の解決にも使うため）
 for fr,fu,fv,fp,fq,fw,fo in eb:
     ft[bz(fu,fv)]=(fw,fo); ju[jv(bz(fu,fv))]=(fw,fo)
 fx=[]   # cu2=(率,項目,ch,OK,NG,key)
@@ -634,7 +773,8 @@ fz=sum(by for db,bd,by,fr in dw); ga=sum(bd for db,bd,by,fr in dw)
 gb=100.0*ga/fz if fz else 0
 gc=len([1 for ej in fx if ej[4]>0])
 gd=ge=gf=0
-for cc in ds:
+#★旧| for cc in ds:
+for cc in jx:   # 前回“掲載された”keyだけを前回値として集計（状態マージで全履歴が混ざるのを防ぐ）   #▲修正7
     gg=bs(ds[cc])
     if gg: gd+=gg[0]; ge+=gg[1]; gf+=1 if gg[1]>0 else 0
 gh=100.0*ge/(gd+ge) if (gd+ge) else 0
@@ -699,13 +839,14 @@ def gw(gx):
         return dk
 #===== ★変更17 ここから ===== 本文タイトルを「トピックス」に変更／期間の注意書きを新仕様に差替
 #★旧|     dk=u'<html><body style="font-family:Meiryo;font-size:14px"><h2>SPC 日次トピックス</h2>'
-#★旧|     dk+=u'<p style="background:#fff8e1;border-left:4px solid #f0ad4e;padding:6px 10px">【集計期間について】既存の装置chは「最新加工日時から直近%d日」、今回初めて登場した装置chは「全期間」で集計しています。そのため初回の装置chは母数が大きくなります（下表の「集計」欄を参照）。</p>'%n
+#★旧|     dk+=u'<p ...>【集計期間について】既存の装置chは「最新加工日時から直近%d日」、今回初めて登場した装置chは「全期間」で集計しています。...</p>'%n
+#★旧|     dk+=u'<p ...>【期間について】<b>NG率・悪化・改善・新規</b>＝そのchの最新加工日時から直近%d日（...）。...</p>'%(n,n,ia,ia)
     dk=u'<html><body style="font-family:Meiryo;font-size:14px"><h2>トピックス</h2>'   #★変更17
-    dk+=u'<p style="background:#fff8e1;border-left:4px solid #f0ad4e;padding:6px 10px">【期間について】<b>NG率・悪化・改善・新規</b>＝そのchの最新加工日時から直近%d日（初登場ch／%d日以上データが無い停止chは全期間。下表「集計」欄を参照）。<b>推移パターンの判定</b>＝直近%d日。検出は最大4週間掲載され、%d日窓から外れると自動的に消えます（「新規／継続N回目」を併記）。<b>グラフ画像</b>＝全期間表示のため、上記の期間とは一致しません。</p>'%(n,n,ia,ia)   #★変更17
+    dk+=u'<p style="background:#fff8e1;border-left:4px solid #f0ad4e;padding:6px 10px">【期間について】<b>NG率・悪化・改善・新規</b>＝<b>前回配信以降に新しく追加された加工日時のデータだけ</b>を集計しています（初登場の装置chのみ全期間。下表「集計」欄を参照）。ロット単位の抽出により先々週以前の工程データが再び取り込まれても、<b>配信済みの分は二重計上しません</b>（今回新規データが無い装置chは掲載されません）。<b>推移パターンの判定</b>＝実行日から直近%d日。%d日窓から外れた検出は自動的に消えます（「新規／継続N回目」を併記）。<b>グラフ画像</b>＝全期間表示のため、上記の期間とは一致しません。</p>'%(ia,ia)   #▲修正9
 #===== ★変更17 ここまで =====
     dk+=u'<p><b>■全体サマリ</b><br>全体NG率：%.2f%%（前回 %.2f%%）／ NGのあった装置ch：%d（前回 %d）</p>'%(gb,gh,gc,gf)
     dk+=hg(u'■悪化幅トップ%d（前回比でNG率が上がった装置ch）'%af,gi,lambda ba:u'<p><b>%s ／ %s</b>：OK %d ・ NG %d ・ 母数 %d ／ NG率 %.2f%%（前回 %.2f%% ／ +%.2f）</p>'%(bo(ba[1]),bo(ba[2]),ba[3],ba[4],ba[3]+ba[4],ba[5],ba[6],ba[0]),u"w")
-    dk+=hg(u'■NG率トップ%d（絶対値）'%ag,gk,lambda ba:u'<p><b>%s ／ %s</b>：OK %d ・ NG %d ・ 母数 %d ／ NG率 %.2f%% ／ [%s]</p>'%(bo(ba[1]),bo(ba[2]),ba[3],ba[4],ba[3]+ba[4],ba[0],ec.get(ba[5],u"")),u"t")
+    dk+=hg(u'■NG率トップ%d（絶対値・今回分）'%ag,gk,lambda ba:u'<p><b>%s ／ %s</b>：OK %d ・ NG %d ・ 母数 %d ／ NG率 %.2f%% ／ [%s]</p>'%(bo(ba[1]),bo(ba[2]),ba[3],ba[4],ba[3]+ba[4],ba[0],ec.get(ba[5],u"")),u"t")
     dk+=u'<p><b>■NGのある全装置ch（NG率順・%d件）</b></p>'%len(gl)
     if gl:
         dk+=u'<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;font-size:13px">'+hc((u'順位',u'項目',u'装置ch',u'OK',u'NG',u'母数',u'NG率',u'集計',u'推移の特徴'))
@@ -738,19 +879,19 @@ def gw(gx):
     return dk
 
 hn=u"".join(u"<tr><td>%s</td><td>%d</td><td>%d</td><td>%.2f%%</td></tr>"%(bo(db),bd,by,fr) for db,bd,by,fr in dw)
-#===== ★変更20 ここから ===== 詳細HTMLのh1を「NG率レポート（自動配信）」に変更／期間注意書き差替／CSSの%%→%(既知バグ修正)
-#★旧| ho=(u'body{font-family:Meiryo;margin:32px}h2{background:#f0f3f7;padding:8px 12px;border-left:6px solid #c0392b}'u'.m{color:#c0392b;font-weight:bold}.lbl{font-weight:bold;background:#eef;padding:3px 8px;margin:12px 0 2px;border-left:4px solid #36c}'u'.note{background:#fff8e1;border-left:4px solid #f0ad4e;padding:6px 10px}'u'img{max-width:100%%;border:1px solid #ccc}section{page-break-inside:avoid}table{border-collapse:collapse}td,th{border:1px solid #999;padding:4px 10px}')   # BUG?: %は%%必須
-#★旧| hp=(u'<!DOCTYPE html><meta charset="utf-8"><style>%s</style><h1>SPC NG率レポート（自動配信）</h1>'
-#★旧|  u'<p class="note">【集計期間】既存の装置chは「最新加工日時から直近%d日」、初登場の装置chは「全期間」で集計。各画像ラベル末尾の [直近%d日]／[全期間] で区別できます。</p>'
+#===== ★変更20 ここから ===== 詳細HTMLのh1／期間注意書き／CSSの%%→%(既知バグ修正)
+#★旧| ho=(... u'img{max-width:100%%;...')   # BUG?: %は%%必須
+#★旧| hp=(u'...<p class="note">【期間】NG率＝直近%d日（初登場ch・停止chは全期間...）。推移パターン判定＝直近%d日。...</p>'
 ho=(u'body{font-family:Meiryo;margin:32px}h2{background:#f0f3f7;padding:8px 12px;border-left:6px solid #c0392b}'u'.m{color:#c0392b;font-weight:bold}.lbl{font-weight:bold;background:#eef;padding:3px 8px;margin:12px 0 2px;border-left:4px solid #36c}'u'.note{background:#fff8e1;border-left:4px solid #f0ad4e;padding:6px 10px}'u'img{max-width:100%;border:1px solid #ccc}section{page-break-inside:avoid}table{border-collapse:collapse}td,th{border:1px solid #999;padding:4px 10px}')   # 注: hoは%書式の引数として渡すため、%はエスケープ不要（旧版の%%は無効CSSだった）   #★変更20
 hp=(u'<!DOCTYPE html><meta charset="utf-8"><style>%s</style><h1>NG率レポート（自動配信）</h1>'   #★変更20
- u'<p class="note">【期間】NG率＝直近%d日（初登場ch・停止chは全期間、画像ラベル末尾の [直近%d日]／[全期間] で区別）。推移パターン判定＝直近%d日。グラフ画像は全期間表示です。</p>'   #★変更20
+ u'<p class="note">【期間】NG率＝<b>前回配信以降に追加された加工日時のデータのみ</b>（初登場chは全期間。画像ラベル末尾の [前回以降]／[初回(全期間)] で区別）。ロット遡及で再取得された配信済みデータは二重計上しません。推移パターン判定＝実行日から直近%d日。グラフ画像は全期間表示です。</p>'   #▲修正9
 #===== ★変更20 ここまで =====
  u'<p>作成 %s ／ 失敗 %d 件 ／ 画像 %d 枚 ／ 差分スキップ %d 件</p>'
  u'<table><tr><th>項目</th><th>NG数</th><th>母数</th><th>NG率</th></tr>%s</table>%s%s'
-#===== ★変更21 ここから ===== 詳細HTMLの書式引数に ia を追加
+#===== ★変更21 ここから ===== 詳細HTMLの書式引数
 #★旧|  %(ho,n,n,DateTime.Now.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),
- %(ho,n,n,ia,DateTime.Now.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),   #★変更21
+#★旧|  %(ho,n,n,ia,DateTime.Now.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),
+ %(ho,ia,jd.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),   #▲修正9
 #===== ★変更21 ここまで =====
    (u"<h2>失敗</h2><pre>"+bo(u"\n".join(dy))+u"</pre>") if dy else u""))
 hq=StreamWriter(d(at,"ng_report.html"),False,Encoding.UTF8); hq.Write(hp); hq.Close()
@@ -773,19 +914,26 @@ for gq in do:
 hq=StreamWriter(d(at,"mail_body_preview.html"),False,Encoding.UTF8); hq.Write(gw(hr)); hq.Close()
 
 # zip（baseの外に作る）  BUG?: base内に作ると自分を固め使用中エラー
-ht=d(ar,"ng_report_%s.zip"%DateTime.Now.ToString("yyyyMMdd_HHmm"))
+#★旧| ht=d(ar,"ng_report_%s.zip"%DateTime.Now.ToString("yyyyMMdd_HHmm"))
+ht=d(ar,"ng_report_%s.zip"%jd.ToString("yyyyMMdd_HHmm"))   #▲修正1
 if File.Exists(ht): File.Delete(ht)
 e(300); ZipFile.CreateFromDirectory(at,ht)
 
 print "=== 完了 ==="
 #===== ★変更22 ここから ===== 完了ログの期間表示を新仕様に差替
 #★旧| print "集計: 既存ch=直近%d日 / 初回ch=全期間"%n
-print "集計: NG率=直近%d日(初回/停止ch=全期間) / ルール判定=直近%d日"%(n,ia)   #★変更22
+#★旧| print "集計: NG率=直近%d日(初回/停止ch=全期間) / ルール判定=直近%d日"%(n,ia)
+print "集計: NG率=前回配信以降の新規行のみ(初回ch=全期間 / 水位線なしkeyは移行として直近%d日) / ルール判定=実行時刻から直近%d日"%(n,ia)   #▲修正9
 #===== ★変更22 ここまで =====
 print "zip:",ht
 print "画像%d / 差分skip%d / 失敗%d"%(dz,ea,len(dy))
 print "DBG 集計ch総数=%d / 画像=%d"%(len(dv),dz)
 print "画像未取得ch=%d件"%len(jw)
+#===== ▲修正10 ここから ===== 二重計上対策の診断
+print "DBG 既報スキップ=%d行 / 移行窓スキップ=%d行 / 未知判定値=%d行"%(jr["skip"],jr["old"],jr["unk"])   #▲修正10
+print "DBG 水位線を更新したkey=%d件（次回はこの加工日時より後の行だけを集計）"%len(jm)   #▲修正10
+if jr["unk"]: print "WARN 判定列にOK/NG以外の値が%d行あります（列指定または表記の確認を推奨）"%jr["unk"]   #▲修正10
+#===== ▲修正10 ここまで =====
 #===== ★追加23 ここから ===== 診断print(窓内点数の分布・ゲート未達件数・各ルールの点数到達率)
 if ii:   #★追加23
     ii.sort()   #★追加23
