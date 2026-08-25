@@ -347,6 +347,17 @@ c=DataValueCursor.Create      # 値カーソル生成（総称メソッド群 DV
 d=Path.Combine                # パス連結
 e=Thread.Sleep                # 待機(ms)
 
+# ┌─【区分】設定 ──────────────────────────────────────────────────────────
+# │ 対象   f=表名  g=判定列  h=装置ch列  m=加工日時列  o=実測値  p=中心線  q=σ_LOT  r=ロットID
+# │ 画面   i=項目切替プロパティ  j=対象グラフ名  k=σ係数プロパティ  l=移動平均Nプロパティ  ad=項目一覧プロパティ  ae=項目一覧の列
+# │ 期間   n=移行用の窓(日)  ia=ルール判定窓(日)  jd=実行基準時刻  jb=水位線方式のON/OFF
+# │ 判定   s=既定の集計単位  t=単位が逆の項目  u=ルール判定の最小点数  v=種類別トップ件数
+# │ 掲載   af=悪化  ag=NG率  ah=新規 の各トップ件数  ai=表掲載の最小NG率
+# │ 画像   w,x=画像の幅高  y=JPEG品質
+# │ 配信   z=送信元  aa=送信先  ab=SMTPサーバ  ac=SMTPポート
+# │ モード aj=TEST  ak=NGページのみ  al=差分のみ  am=送信可否  an=TEST:前回状態を固定  ao=TEST:状態を保存する
+# │ 保存   ap=TEST出力先  aq=文書プロパティ名  ks=状態ファイル  kt=失効日数  kh/kj/kc=コード履歴の設定
+# └──────────────────────────────────────────────────────────────────────────
 f="データ"; g="＜判定列名＞"; h="004_Gr_1"; i="項目1"; j="＜グラフ名＞"
 k="SIGMA_K"; l="MA_N"
 #===== ★変更3 ここから ===== n=7→n=8(NG率窓)、ia=30(ルール判定窓)を新設
@@ -378,17 +389,115 @@ jb=True           # True=既報行を水位線で除外（推奨） / False=旧�
 ks=u""            # 例: ur"\\＜サーバ＞\＜共有＞\spc\spc_state.txt"   #▲修正13
 kt=180            # 状態の失効日数。この日数更新の無いkeyは保存時に捨てる（0で無効）   #▲修正13
 #===== ▲修正13 ここまで =====
+#===== ▲追加16 ここから ===== コード履歴（実行のたびに版数を記録し、変わっていれば差分を出力）
+kh=u""            # 履歴の保存先フォルダ。空なら 出力ルート\code_history   #▲追加16
+kj=u""            # Spotfireに登録したスクリプト名（ScriptManager経由で本文を取る場合に指定）   #▲追加16
+kc=u""            # マスター.pyのパス。上記で本文が取れない環境ではここから読む（最終手段）   #▲追加16
+#===== ▲追加16 ここまで =====
 
+# ┌─【区分】出力フォルダとデータテーブル ──────────────────────────────────
+# │ ar=出力ルート(TEST_DIR または Temp)   at=実行フォルダ run_日時   au=画像フォルダ   av=対象データテーブル
+# └──────────────────────────────────────────────────────────────────────────
 ar=ap if aj else Path.GetTempPath()
 if not Directory.Exists(ar): Directory.CreateDirectory(ar)
 #★旧| at=d(ar,"run_"+DateTime.Now.ToString("yyyyMMdd_HHmmss"))
 at=d(ar,"run_"+jd.ToString("yyyyMMdd_HHmmss"))   #▲修正1
 au=d(at,"img"); Directory.CreateDirectory(au)
 
+#===== ▲追加16 ここから ===== コード履歴：版数の記録と差分出力
+# ┌─【区分】コード履歴 ────────────────────────────────────────
+# │ kg()=本文のSHA1先頭12桁（＝版数）      kk()=スクリプト本文の取得（戻り: 本文, 取得経路）
+# │ km()=版数の判定・差分作成・履歴追記    kz=メール等に出す版数表示   ky=今回の差分テキスト
+# │ 出力先(kh または 出力ルート\code_history):
+# │   latest.py … 直近の本文  code_日時_版数.py … 版ごとのスナップショット
+# │   diff_日時.txt … 前版との差分(unified) code_history.tsv … 1実行1行の履歴台帳
+# │   変更があった回は 実行フォルダにも code_diff.txt を置くので添付zipで配布される
+# └──────────────────────────────────────────────────────
+try:   # 差分生成。difflibが無い環境でも履歴が止まらないよう簡易版を用意する
+    import difflib
+    def kD(ay,bt,c1,c2): return u"\n".join(difflib.unified_diff(ay.splitlines(),bt.splitlines(),fromfile=c1,tofile=c2,lineterm=u""))
+except ImportError:
+    def kD(ay,bt,c1,c2):
+        a1=ay.splitlines(); b1=bt.splitlines(); s1=set(a1); s2=set(b1)
+        bp=[u"--- %s"%c1,u"+++ %s"%c2,u"(difflibが使えないため、行の増減だけの粗い差分です)"]
+        for db,du in enumerate(b1,1):
+            if du not in s1: bp.append(u"+%d: %s"%(db,du))
+        for db,du in enumerate(a1,1):
+            if du not in s2: bp.append(u"-%d: %s"%(db,du))
+        return u"\n".join(bp)
+from System.Security.Cryptography import SHA1
+def kg(bp):   # 版数＝本文のSHA1先頭12桁
+    try:
+        ba=SHA1.Create().ComputeHash(Encoding.UTF8.GetBytes(bp))
+        return u"".join(u"%02x"%(bd&0xff) for bd in ba)[:12]
+    except: return u"?"
+def kk():     # 本文の取得。環境によって取れる経路が違うので順に試す
+    try:
+        if u"__file__" in globals() and __file__ and File.Exists(__file__):
+            return File.ReadAllText(__file__,Encoding.UTF8),u"__file__"
+    except: pass
+    try:      # Spotfireに登録したスクリプトから取得（APIの形は版により違うため2通り試す）
+        if kj:
+            ba=Document.ScriptManager.TryGetScript(kj)
+            if ba and ba[0] and ba[1] is not None: return ba[1].ScriptCode,u"ScriptManager(%s)"%kj
+    except: pass
+    try:
+        for ba in Document.ScriptManager.GetScripts():
+            if (not kj) or ba.Name==kj: return ba.ScriptCode,u"ScriptManager:%s"%ba.Name
+    except: pass
+    try:
+        if kc and File.Exists(kc): return File.ReadAllText(kc,Encoding.UTF8),u"マスターファイル"
+    except: pass
+    return None,u"取得不可"
+def km():
+    bt,bp=kk()
+    if bt is None:
+        print "WARN スクリプト本文を取得できません（kj にスクリプト名、または kc にマスター.pyのパスを設定してください）"
+        return u"版数不明",None
+    cc=kg(bt); ba=kh or d(ar,u"code_history")
+    try:
+        if not Directory.Exists(ba): Directory.CreateDirectory(ba)
+    except Exception,bb:
+        print "WARN コード履歴フォルダを作成できません:",bb; return u"版数 %s"%cc,None
+    bd=d(ba,u"latest.py"); ay=None
+    try:
+        if File.Exists(bd): ay=File.ReadAllText(bd,Encoding.UTF8)
+    except: ay=None
+    if ay is not None and kg(ay)==cc:
+        print "コード履歴: 変更なし（版数 %s / 取得元 %s）"%(cc,bp)
+        return u"版数 %s（前回から変更なし）"%cc,None
+    az=jd.ToString("yyyyMMdd_HHmmss"); ct=None
+    if ay is not None: ct=kD(ay,bt,u"前回 %s"%kg(ay),u"今回 %s"%cc)
+    cu=len([1 for du in (ct or u"").split(u"\n") if du[:1]==u"+" and du[:3]!=u"+++"])
+    cw2=len([1 for du in (ct or u"").split(u"\n") if du[:1]==u"-" and du[:3]!=u"---"])
+    try:
+        File.WriteAllText(d(ba,u"code_%s_%s.py"%(az,cc)),bt,Encoding.UTF8)
+        File.WriteAllText(bd,bt,Encoding.UTF8)
+        if ct: File.WriteAllText(d(ba,u"diff_%s.txt"%az),ct,Encoding.UTF8)
+        if not File.Exists(d(ba,u"code_history.tsv")):
+            File.WriteAllText(d(ba,u"code_history.tsv"),u"日時\t版数\t前版数\t取得元\t行数\t追加\t削除\n",Encoding.UTF8)
+        File.AppendAllText(d(ba,u"code_history.tsv"),u"%s\t%s\t%s\t%s\t%d\t%d\t%d\n"%(
+            jd.ToString("yyyy-MM-dd HH:mm:ss"),cc,kg(ay) if ay is not None else u"-",bp,len(bt.splitlines()),cu,cw2),Encoding.UTF8)
+    except Exception,bb:
+        print "WARN コード履歴の書き込みに失敗:",bb
+    if ct:
+        try: File.WriteAllText(d(at,u"code_diff.txt"),ct,Encoding.UTF8)   # 添付zipにも同梱
+        except: pass
+        print "コード履歴: 変更あり 版数 %s（+%d/-%d行・取得元 %s）"%(cc,cu,cw2,bp)
+        return u"版数 %s（前回から +%d／−%d 行）"%(cc,cu,cw2),ct
+    print "コード履歴: 初回記録 版数 %s（取得元 %s）"%(cc,bp)
+    return u"版数 %s（履歴の初回記録）"%cc,None
+kz,ky=km()
+#===== ▲追加16 ここまで =====
+
 av=b.Tables[f]
 
 # 項目一覧：候補値メンバー→列ノードの順で試し、ダメなら手動代入
 # BUG?: 経路A/BはSpotfire更新でAPI変化→全滅しうる。その時は下の手動リストに落ちる。
+# ┌─【区分】項目一覧の取得 ────────────────────────────────────────────────
+# │ aw()=項目一覧を返す関数   be=監視項目の一覧   ax/ay/az/ba/bb/bc/bd=関数内の一時変数
+# │ 経路A=文書プロパティの候補値 → 経路B=列ノード → 手動リスト の順に試す
+# └──────────────────────────────────────────────────────────────────────────
 def aw():
     try:
         ax=b.Properties.GetProperty(DataPropertyClass.Document,ad)
@@ -411,12 +520,21 @@ if not be:
     be=[u"工程A|膜厚|STEP",u"工程A|Rs|STEP",u"工程B|CD|STEP"]   # ←実項目名に置換（キー生成がunicode前提のためu""必須）   #▲修正8
     print "items手動:",len(be)
 
+# ┌─【区分】ビジュアル参照と列カーソル ────────────────────────────────────
+# │ bf=対象トレリスグラフ   bh=判定列  bi=装置ch列  bj=加工日時  bk=実測値  bl=中心線  bm=σ_LOT  bn=ロットID
+# │ カーソルはここで1回だけ作り、以降のGetRowsで使い回す
+# └──────────────────────────────────────────────────────────────────────────
 bf=[az.As[VisualContent]() for bg in Document.Pages for az in bg.Visuals if az.Title==j][0]
 bh=c[String](av.Columns[g]); bi=c[String](av.Columns[h])
 bj=c[DateTime](av.Columns[m])
 bk=c[Double](av.Columns[o]); bl=c[Double](av.Columns[p])
 bm=c[Double](av.Columns[q]); bn=c[String](av.Columns[r])
 
+# ┌─【区分】小道具（文字列とキーの操作） ──────────────────────────────────
+# │ bo()=HTMLエスケープ  bq()=ファイル名の禁止文字を置換  jv()=表記ゆれ吸収キー(空白/記号/大小文字を無視)
+# │ bs()=状態文字列→(OK,NG,係数,MA)  bv()=NG率%の計算(母数0は0.0)
+# │ bz()=キー生成 項目\x1f装置ch   cb()=キー分解   cd()=先頭要素でソート   ce=「該当なし」のHTML
+# └──────────────────────────────────────────────────────────────────────────
 def bo(bp): return bp.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 def bq(bp):
     for br in u'\\/:*?"<>|': bp=bp.replace(br,u"_")
@@ -440,6 +558,11 @@ import math
 #     ・日時を2000-01-01起点の秒のbase36（6文字）にする
 #   ことで1keyあたり40文字前後に縮む（約6割減）。内部表現は従来のまま（";"区切り7フィールド）なので
 #   集計・比較のコードには一切手を入れていない。読み込みは旧形式(V1)も受け付ける。
+# ┌─【区分】状態のコーデック（保存形式V2） ──────────────────────────────
+# │ ke=base36の基点(2000-01-01)  k3=base36の文字表  k6()=DateTime→base36秒  k7()=その逆
+# │ kd()=区切り文字のサニタイズ  kr()=テキスト→内部辞書(+壊れた行数)  kw()=内部辞書→V2テキスト(+失効)
+# │ kl()=読み込み元の選択(ファイル→文書プロパティ)   kp()=書き込み先の選択(ファイル→失敗時は文書プロパティ)
+# └──────────────────────────────────────────────────────────────────────────
 ke=DateTime(2000,1,1); k3=u"0123456789abcdefghijklmnopqrstuvwxyz"
 def k6(dc):   # DateTime→base36秒。水位線が実時刻より前に戻らないよう切り上げる（＝既報を数え直さない）
     bd=int(math.ceil(dc.Subtract(ke).TotalSeconds))
@@ -512,6 +635,12 @@ def kp(bt):   # 状態の書き込み先: ファイル（一時ファイル経�
     a[aq]=bt; return u"文書プロパティ(%s)"%aq
 #===== ▲修正13 ここまで =====
 
+# ┌─【区分】推移パターンの判定 ────────────────────────────────────────────
+# │ cf=突発異常 cg=トレンド ch=片側シフト ci=変動拡大 cj=貼り付き ck=変動縮小 cl=振動（ルール名の文字列）
+# │ dn=ルール→程度の単位   do=ルールの表示順   me()=中央値   cm()=規格化Z値(σ≒0はNone)
+# │ cp(点列,突発判定するか,トレンド系を判定するか)=検出結果{ルール名:程度}
+# │ 点列の各要素は {"v":実測値,"cl":中心線,"sd":σ_LOT} の辞書
+# └──────────────────────────────────────────────────────────────────────────
 #===== ★変更4 ここから ===== ルール名7種の末尾に「｜過去30日」を明記
 #★旧| cf,cg,ch,ci,cj,ck,cl=u"大きく外れた点がある（突発異常｜CL±6σ_LOTを超過）",u"値が一方向に動き続けている（トレンド｜同方向に6点以上連続）",u"中心から片側にずれ続けている（CLの同じ側に9点以上連続）",u"変動が大きくなってきている（不安定化｜後半のσ_LOTが前半の1.8倍超）",u"値がほとんど動いていない（貼り付き｜CL±1σ_LOT内に15点以上連続）",u"変動が小さくなってきている（貼り付きの前兆｜後半のσ_LOTが前半の0.5倍未満）",u"規則的に上下を繰り返している（振動｜上下交互が14点以上連続）"
 cf,cg,ch,ci,cj,ck,cl=u"大きく外れた点がある（突発異常｜CL±6σ_LOTを超過｜過去30日）",u"値が一方向に動き続けている（トレンド｜同方向に6点以上連続｜過去30日）",u"中心から片側にずれ続けている（CLの同じ側に9点以上連続｜過去30日）",u"変動が大きくなってきている（不安定化｜後半のσ_LOTが前半の1.8倍超｜過去30日）",u"値がほとんど動いていない（貼り付き｜CL±1σ_LOT内に15点以上連続｜過去30日）",u"変動が小さくなってきている（貼り付きの前兆｜後半のσ_LOTが前半の0.5倍未満｜過去30日）",u"規則的に上下を繰り返している（振動｜上下交互が14点以上連続｜過去30日）"   #★変更4
@@ -569,9 +698,18 @@ def cp(cq,cr=True,cs=True):
 dn={cf:u"%",cg:u"点連続",ch:u"点連続",cj:u"点連続",cl:u"点",ci:u"倍",ck:u"倍"}
 do=[cf,cg,ch,ci,cj,ck,cl]
 
+# ┌─【区分】JPEGエンコーダ ────────────────────────────────────────────
+# │ dp=JPEGエンコーダ   dr=品質パラメータ(yで指定した品質)
+# └──────────────────────────────────────────────────────────────────────────
 dp=[dq for dq in ImageCodecInfo.GetImageEncoders() if dq.FormatID==ImageFormat.Jpeg.Guid][0]
 dr=EncoderParameters(1); dr.Param[0]=EncoderParameter(Encoder.Quality,y)
 
+# ┌─【区分】前回状態の読み込みと今回用の入れもの ──────────────────────────
+# │ ds=前回状態(key→状態文字列)   dt=読み込んだ生テキスト   kb=解析できなかった行数
+# │ ja()=状態のn番目→日時   jc=key→水位線   jx=前回“掲載された”keyの集合(前回サマリの母集合)
+# │ jm=今回数えた最新加工日時(次回の水位線)   jl=今回の新規判定行数   ka=全期間の参考値[OK,NG]
+# │ jr=診断カウンタ(skip=既報/old=移行窓/unk=未知判定値)   dv=今回の集計結果
+# └──────────────────────────────────────────────────────────────────────────
 ds={}   # 前回状態 prev[key]="OK;NG;係数;MA;継続回数;水位線;更新した実行時刻"   #▲修正2/7
 #===== ▲修正13 ここから ===== 読み込みをV1/V2両対応にし、破損を握りつぶさず件数を出す
 #★旧| try:
@@ -627,6 +765,12 @@ di=TimeSpan(n,0,0,0); ib=TimeSpan(ia,0,0,0)   # di=移行用フォールバッ�
 #===== ★変更5 ここまで =====
 try: jq=a[i]        # 実行前の項目選択を退避
 except: jq=None
+# ┌─【区分】項目ループ：NG率の集計 ──────────────────────────────────────
+# │ ee=今の項目   ef=σ係数   eg=移動平均N   eh=判定のある行の最新日時   eh0=全行の最新日時(頁の母集合)
+# │ ej/er=装置ch   dc=加工日時   az=判定値   eo=キー(項目+ch)   jk=このkeyの水位線
+# │ ek=項目内NG数  el=項目内母数  em=ch→NG数  en=ch→OK数  jt=除外ch(OK皆無かつNGあり)  eq=掲載ch
+# │ ec=key→集計区分ラベル(前回以降/初回(全期間)/移行)   ji/je/jj=診断カウンタ
+# └──────────────────────────────────────────────────────────────────────────
 for ee in be:
     try:
         a[i]=ee; e(400)   # BUG?: Sleep短いと前項目値を読む
@@ -704,6 +848,12 @@ for ee in be:
             ec[eo]=u"前回以降" if eo in jc else ((u"移行(直近%d日)"%n) if eo in ds else u"初回(全期間)")   #▲修正9
 #===== ★変更8 ここまで =====
         print "DBG %s: 新規判定行=%d / 既報スキップ=%d / 移行窓スキップ=%d / 未知判定値=%d / 掲載ch=%d(除外%d) / 判定ありch=%d(全ch=%d)"%(ee,el,ji,je,jj,len(eq),len(jt),len(eh),len(eh0))   #▲修正10
+        # ┌─【区分】項目ループ：系列の収集とルール判定 ────────────────────────────
+        # │ es=ロット単位かどうか   et=収集に使うカーソル一覧   ew=ロット集約バッファ
+        # │ eu=ch→系列(日時,値,CL,σ)   ev=ch→ウエハ生系列   cq/fe=点列   fc=検出結果   ed=key→検出結果
+        # │ ii=診断用の窓内点数   jo=画像を撮る対象ch(集計あり ∪ 検出あり)
+        # │ 期間は実行時刻から ia 日の絶対窓。NG率の窓とは無関係
+        # └──────────────────────────────────────────────────────────────────────────
         es=(ee not in t) if s=="lot" else (ee in t)
         et=[bi,bj,bk,bl,bm,bn]; eu={}; ev={}
         if es:
@@ -753,6 +903,11 @@ for ee in be:
             else:
                 fc=cp(cq,True,True) if len(cq)>=u else {}
             if fc: ed[bz(ee,er)]=fc; jo.add(er)   # 集計は無くても検出があるchは撮る   #▲修正8
+        # ┌─【区分】項目ループ：グラフ画像の撮影 ──────────────────────────────────
+        # │ ff=chの並び(頁の母集合)  jz=正規化ch名→実ch名  fi=トレリス  fj=頁数  fk=頁index  js=頁名  jp=元の表示頁
+        # │ fl=この頁の装置ch   fm=表示用のch名   fo=画像ファイル名   ca=Bitmap   fn=Graphics
+        # │ fp/fq=今回のOK/NG   fr=NG率   fs=画像ラベル   eb=画像台帳   jw=撮れなかったch   fh/dx=詳細HTMLの断片
+        # └──────────────────────────────────────────────────────────────────────────
 #===== ▲修正8 ここから ===== 描画対象を jo に一本化（集計あり ∪ ルール検出あり）
         if jo:
 #★旧|         if eq:
@@ -821,6 +976,10 @@ if jq is not None:   # 実行後に項目選択を元へ戻す
     except: pass
 #===== ★追加13 ここから ===== ルール継続回数の算出と状態5番目への保存(ik/ij/ig/ih/im)
 # --- ルール検出の継続回数（状態の5番目のフィールドに保存） ---   #★追加13
+# ┌─【区分】ルール検出の継続回数 ──────────────────────────────────────────
+# │ ik=ルール名→番号   ij()=状態の5番目→継続回数の辞書   ig=前回の継続回数   ih=今回の継続回数
+# │ im()=表示用の「新規／継続N回目」   検出が続いた“配信回数”を数える（週数ではない）
+# └──────────────────────────────────────────────────────────────────────────
 ik={}   #★追加13
 for db,gq in enumerate(do): ik[gq]=db   # ルール名→インデックス（名称変更に強い）   #★追加13
 def ij(bt):   # 状態文字列の5番目「idx:回数,...」を辞書に   #★追加13
@@ -855,6 +1014,10 @@ def im(cc,gq):   # 表示用「新規／継続N回目」   #★追加13
 #   ・今回新規データが無かったkeyの水位線・継続回数・前回値が消える
 #   ・翌週そのkeyが「初登場」に戻り、全期間集計で先週と同じ数字が再浮上する
 # という失敗/成功が隔週で入れ替わる挙動になっていた。ここでマージして持ち越す。
+# ┌─【区分】状態の直列化と確定 ────────────────────────────────────────────
+# │ jy()=1keyぶんの状態文字列を組み立てる   jn=マージ後の状態辞書(掲載されなかったkeyも持ち越す)
+# │ kv=保存するテキスト   kn=採用件数   kf=失効で捨てた件数   kq()=実際に保存する（配信成功後に呼ぶ）
+# └──────────────────────────────────────────────────────────────────────────
 def jy(cc):   # 保存用の状態文字列 "OK;NG;係数;MA;継続回数;水位線ticks;更新した実行時刻ticks"   #▲修正7
     bu=(jn.get(cc) or u"").split(u";")
     while len(bu)<7: bu.append(u"")
@@ -882,6 +1045,11 @@ def kq():   # 状態の確定（配信が成立した後にだけ呼ぶ）   #�
 #===== ▲修正15 ここまで =====
 #===== ▲修正7 ここまで =====
 
+# ┌─【区分】画像台帳とランキングの組み立て ────────────────────────────────
+# │ ft=key→画像   ju=正規化key→画像   fx=今回の全key(率,項目,ch,OK,NG,key)
+# │ fz/ga/gb=全体の母数/NG/率   gc=NGのあったch数   gd/ge/gf/gh=前回の同じ値
+# │ gi=悪化   gk=NG率トップ   gl=一覧表   gm=新規発生   gn=改善   gp=ルール種類別トップ   gs()=推移特徴の文字列
+# └──────────────────────────────────────────────────────────────────────────
 ft={}; ju={}
 #★旧| def jv(cc): ...   ←▲修正8で定義を前倒し（トレリス頁名の解決にも使うため）
 for fr,fu,fv,fp,fq,fw,fo in eb:
@@ -944,6 +1112,11 @@ def gs(eo):
 #===== ★変更15 ここまで =====
     return u" / ".join(gt)
 
+# ┌─【区分】メール本文の組み立て ──────────────────────────────────────────
+# │ gw(画像srcを返す関数)=本文HTML   gy()=画像タグ   hb()=セル   hc()=行   he()=箇条書き   hg()=見出し+一覧+画像
+# │ dk=本文を組み立てていく文字列   hj=表の順位   hm=画像の通番   kz=スクリプト版数   ky=コード差分
+# │ プレビューは hr()（相対パス）、送信時は hv()（cid埋め込み）を渡して同じ関数を使い回す
+# └──────────────────────────────────────────────────────────────────────────
 def gw(gx):
     def gy(cc,gz):
         ha=ft.get(cc) or ju.get(jv(cc))   # 完全一致→表記ゆれ吸収の順で引く
@@ -997,9 +1170,19 @@ def gw(gx):
             hm+=1; ey=u"%.1f%s"%(gr,gu) if gu in (u"倍",) else u"%d%s"%(int(gr),gu)   #★変更19
             dk+=u'<p><b>%s ／ %s</b>：程度 %s ／ <span style="color:#c0392b">%s</span></p>'%(bo(fu),bo(fv),ey,im(cc,gq))+gy(cc,u"r%d"%hm)   #★変更19
 #===== ★変更19 ここまで =====
-    dk+=u'<hr><p>全項目・全画像の詳細は、添付zip内の ng_report.html をご覧ください。</p></body></html>'
+    dk+=u'<hr><p>全項目・全画像の詳細は、添付zip内の ng_report.html をご覧ください。</p>'
+#===== ▲追加16 ここから ===== 末尾に版数を明記（どのコードが出した数字かを配信物だけで追える）
+    dk+=u'<p style="color:#888;font-size:12px">スクリプト %s ／ 実行 %s%s</p>'%(
+        bo(kz),jd.ToString("yyyy-MM-dd HH:mm"),
+        u' ／ <b>コード変更あり</b>：差分は添付zip内の code_diff.txt' if ky else u"")   #▲追加16
+#===== ▲追加16 ここまで =====
+    dk+=u'</body></html>'
     return dk
 
+# ┌─【区分】詳細HTMLとCSVの出力 ────────────────────────────────────
+# │ hn=項目別サマリの表   ho=CSS   hp=詳細HTML全体   hq=書き込みStreamWriter
+# │ ng_report.html=詳細  ng_summary.csv=集計(Shift_JIS)  mail_body_preview.html=本文プレビュー
+# └──────────────────────────────────────────────────────────────────────────
 hn=u"".join(u"<tr><td>%s</td><td>%d</td><td>%d</td><td>%.2f%%</td></tr>"%(bo(db),bd,by,fr) for db,bd,by,fr in dw)
 #===== ★変更20 ここから ===== 詳細HTMLのh1／期間注意書き／CSSの%%→%(既知バグ修正)
 #★旧| ho=(... u'img{max-width:100%%;...')   # BUG?: %は%%必須
@@ -1008,12 +1191,12 @@ ho=(u'body{font-family:Meiryo;margin:32px}h2{background:#f0f3f7;padding:8px 12px
 hp=(u'<!DOCTYPE html><meta charset="utf-8"><style>%s</style><h1>NG率レポート（自動配信）</h1>'   #★変更20
  u'<p class="note">【期間】NG率＝<b>前回配信以降に追加された加工日時のデータのみ</b>（初登場chは全期間。画像ラベル末尾の [前回以降]／[初回(全期間)] で区別）。ロット遡及で再取得された配信済みデータは二重計上しません。推移パターン判定＝実行日から直近%d日。グラフ画像は全期間表示です。</p>'   #▲修正9
 #===== ★変更20 ここまで =====
- u'<p>作成 %s ／ 失敗 %d 件 ／ 画像 %d 枚 ／ 差分スキップ %d 件</p>'
+ u'<p>作成 %s ／ 失敗 %d 件 ／ 画像 %d 枚 ／ 差分スキップ %d 件 ／ スクリプト %s</p>'   #▲追加16
  u'<table><tr><th>項目</th><th>NG数</th><th>母数</th><th>NG率</th></tr>%s</table>%s%s'
 #===== ★変更21 ここから ===== 詳細HTMLの書式引数
 #★旧|  %(ho,n,n,DateTime.Now.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),
 #★旧|  %(ho,n,n,ia,DateTime.Now.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),
- %(ho,ia,jd.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,hn,u"".join(dx),   #▲修正9
+ %(ho,ia,jd.ToString("yyyy-MM-dd HH:mm"),len(dy),dz,ea,bo(kz),hn,u"".join(dx),   #▲修正9 #▲追加16
 #===== ★変更21 ここまで =====
    (u"<h2>失敗</h2><pre>"+bo(u"\n".join(dy))+u"</pre>") if dy else u""))
 hq=StreamWriter(d(at,"ng_report.html"),False,Encoding.UTF8); hq.Write(hp); hq.Close()
@@ -1036,6 +1219,10 @@ for gq in do:
     for ba in gp.get(gq,[])[:2]: print "DBG ルール key=%r → ftにある=%s"%(ba[3],ba[3] in ft)
 hq=StreamWriter(d(at,"mail_body_preview.html"),False,Encoding.UTF8); hq.Write(gw(hr)); hq.Close()
 
+# ┌─【区分】zipの作成と診断出力 ────────────────────────────────────────
+# │ ht=zipのパス（実行フォルダの外に作る。中に作ると自分を固めて失敗する）
+# │ 以降のprintは実行ログ用。既報スキップ・未知判定値・窓内点数の分布などの健全性指標を出す
+# └──────────────────────────────────────────────────────────────────────────
 # zip（baseの外に作る）  BUG?: base内に作ると自分を固め使用中エラー
 #★旧| ht=d(ar,"ng_report_%s.zip"%DateTime.Now.ToString("yyyyMMdd_HHmm"))
 ht=d(ar,"ng_report_%s.zip"%jd.ToString("yyyyMMdd_HHmm"))   #▲修正1
@@ -1069,6 +1256,11 @@ for cc in jw[:5]: print "  未取得:",repr(cc)
 print "悪化%d / トップ%d / 全NGch%d / 新規%d / 改善%d"%(len(gi),len(gk),len(gl),len(gm),len(gn))
 if dy: print "FAIL0:",dy[0]
 
+# ┌─【区分】メール送信と後始末 ────────────────────────────────────────────
+# │ hu=埋め込み画像   hv()=cidを返す関数   hx=本文   co=MailMessage   hy=HTMLビュー   hz=添付zip
+# │ 送信に成功したときだけ kq() で状態を確定し、実行フォルダとzipを削除する
+# │ 失敗時は状態を保存せず成果物も残し、例外を送出してジョブを失敗扱いにする
+# └──────────────────────────────────────────────────────────────────────────
 # 送信（本番かつSEND_MAIL。TEST中は送らない二重ガード）
 if (not aj) and am:
     from System.Net.Mail import MailMessage,SmtpClient,Attachment,MailAddress,AlternateView,LinkedResource
