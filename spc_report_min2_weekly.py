@@ -364,10 +364,20 @@ ai=0.0
 aj=True; ak=True; al=False; am=True
 an=False; ao=False
 ap=r"C:\Users\＜自分＞\Desktop\spc_test"; aq="SPC_PrevState"
+#★旧| ao=False   # 旧仕様:「TEST時に状態を保存しない」フラグ（既定Falseなので保存されていた）
+#  ▲修正12: 意味を反転。既定(False)ではTEST実行時に状態を保存しない。   #▲修正12
+#           TESTで水位線を進めて本番配信分を食う事故を既定で防ぐ。連続テストで保存したいときだけTrue。
 #===== ▲修正1 ここから ===== 実行基準時刻を1回だけ取得（以降の期間判定は全てこれを基準にする）
 jd=DateTime.Now   # 実行基準時刻。ch相対ではなくこの時刻を基準にすることで期間が毎回同じ意味になる   #▲修正1
 jb=True           # True=既報行を水位線で除外（推奨） / False=旧来型の“実行時刻からn日”窓に退避   #▲修正3
 #===== ▲修正1 ここまで =====
+#===== ▲修正13 ここから ===== 状態の保存先（文書プロパティの容量制限を回避）
+# ks に書き込み可能なパスを入れると、前回状態をそのテキストファイルに保存する（文書プロパティは使わない）。
+# 空文字なら従来どおり文書プロパティ aq に保存。ファイル方式ならSpotfire Serverへの負荷はゼロ、容量制限も無い。
+# 複数ノードでジョブが動く場合は、必ずUNC共有など全ノードから見える場所を指定すること。
+ks=u""            # 例: ur"\\＜サーバ＞\＜共有＞\spc\spc_state.txt"   #▲修正13
+kt=180            # 状態の失効日数。この日数更新の無いkeyは保存時に捨てる（0で無効）   #▲修正13
+#===== ▲修正13 ここまで =====
 
 ar=ap if aj else Path.GetTempPath()
 if not Directory.Exists(ar): Directory.CreateDirectory(ar)
@@ -422,6 +432,85 @@ def jv(cc): return cc.replace(u" ",u"").replace(u"\u3000",u"").replace(u"-",u"")
 #===== ▲修正8 ここまで =====
 
 import math
+
+#===== ▲修正13 ここから ===== 状態のコーデック（V2形式）と入出力
+# 【なぜ形式を変えるか】旧形式は1keyあたり「項目名(長い)+OK;NG;係数;MA;継続;ticks(19桁);ticks(19桁)」で
+#   100文字前後になり、文書プロパティの容量を圧迫していた。V2は
+#     ・項目名を番号化してヘッダに1回だけ書く
+#     ・日時を2000-01-01起点の秒のbase36（6文字）にする
+#   ことで1keyあたり40文字前後に縮む（約6割減）。内部表現は従来のまま（";"区切り7フィールド）なので
+#   集計・比較のコードには一切手を入れていない。読み込みは旧形式(V1)も受け付ける。
+ke=DateTime(2000,1,1); k3=u"0123456789abcdefghijklmnopqrstuvwxyz"
+def k6(dc):   # DateTime→base36秒。水位線が実時刻より前に戻らないよう切り上げる（＝既報を数え直さない）
+    bd=int(math.ceil(dc.Subtract(ke).TotalSeconds))
+    if bd<0: bd=0
+    bp=u""
+    while bd>0: bp=k3[bd%36]+bp; bd=bd//36
+    return bp or u"0"
+def k7(bp):   # base36秒→DateTime
+    bd=0
+    for br in bp: bd=bd*36+k3.index(br)
+    return ke.AddSeconds(bd)
+def kd(bp):   # 区切り文字の混入で状態が壊れるのを防ぐ（B5対策）
+    return bp.replace(u"\t",u" ").replace(u"\r",u"").replace(u"\n",u" ").replace(u"=",u"＝").replace(u";",u"；")
+def kr(bt):   # テキスト→内部辞書{key:"OK;NG;係数;MA;継続;水位線;更新"} + 壊れた行数
+    ct={}; ci={}; bd=0
+    if not bt: return ct,0
+    for du in bt.split(u"\n"):
+        du=du.strip(); du=du.strip(u"\r")
+        if not du: continue
+        if du[:2]==u"#V": continue
+        if du[:2]==u"#I":
+            bu=du.split(u"\t")
+            if len(bu)>=2: ci[bu[0][2:]]=bu[1]
+            else: bd+=1
+            continue
+        if u"\t" in du:                      # V2行: idx,ch,OK,NG,係数,MA,継続,水位線,更新
+            bu=du.split(u"\t")
+            if len(bu)<9 or bu[0] not in ci: bd+=1; continue
+            ct[bz(ci[bu[0]],bu[1])]=u";".join(bu[2:9])
+        elif u"=" in du:                     # V1行(旧形式・移行用)
+            cc,bp=du.rsplit(u"=",1)
+            if len(bp.split(u";"))<2 or not cc: bd+=1; continue
+            ct[cc]=bp
+        else: bd+=1
+    return ct,bd
+def kw(ct):   # 内部辞書→V2テキスト（失効を適用）。戻り値=(テキスト,採用件数,失効件数)
+    ci={}; co2=[]; bd=0
+    for cc in sorted(ct):
+        try: fu,fv=cb(cc)
+        except: continue
+        ep2=ja(ct[cc],6)
+        if kt and ep2 is not None and ep2<jd.AddDays(-kt): bd+=1; continue   # 失効
+        bu=ct[cc].split(u";")
+        while len(bu)<7: bu.append(u"")
+        fu=kd(fu); fv=kd(fv)
+        if fu not in ci: ci[fu]=unicode(len(ci))
+        co2.append(u"\t".join([ci[fu],fv]+[kd(ba) for ba in bu[:7]]))
+    bp=[u"#V2"]+[u"#I%s\t%s"%(ci[fu],fu) for fu in sorted(ci,key=lambda ba:int(ci[ba]))]+co2
+    return u"\n".join(bp),len(co2),bd
+def kl():     # 状態の読み込み元: ファイル→文書プロパティ の順
+    bt=None
+    if ks:
+        try:
+            if File.Exists(ks): bt=File.ReadAllText(ks,Encoding.UTF8); print "状態: ファイルから読込 %s"%ks
+        except Exception,bb: print "WARN 状態ファイルの読込に失敗:",bb
+    if bt is None:
+        try: bt=a[aq]
+        except Exception,bb: print "WARN 文書プロパティの読込に失敗:",bb; bt=None
+    return bt
+def kp(bt):   # 状態の書き込み先: ファイル（一時ファイル経由で壊さない）→ 失敗時は文書プロパティ
+    if ks:
+        try:
+            bp=Path.GetDirectoryName(ks)
+            if bp and not Directory.Exists(bp): Directory.CreateDirectory(bp)
+            File.WriteAllText(ks+u".tmp",bt,Encoding.UTF8)
+            if File.Exists(ks): File.Delete(ks)
+            File.Move(ks+u".tmp",ks)
+            return u"ファイル(%s)"%ks
+        except Exception,bb: print "WARN 状態ファイルの書込に失敗→文書プロパティへ退避:",bb
+    a[aq]=bt; return u"文書プロパティ(%s)"%aq
+#===== ▲修正13 ここまで =====
 
 #===== ★変更4 ここから ===== ルール名7種の末尾に「｜過去30日」を明記
 #★旧| cf,cg,ch,ci,cj,ck,cl=u"大きく外れた点がある（突発異常｜CL±6σ_LOTを超過）",u"値が一方向に動き続けている（トレンド｜同方向に6点以上連続）",u"中心から片側にずれ続けている（CLの同じ側に9点以上連続）",u"変動が大きくなってきている（不安定化｜後半のσ_LOTが前半の1.8倍超）",u"値がほとんど動いていない（貼り付き｜CL±1σ_LOT内に15点以上連続）",u"変動が小さくなってきている（貼り付きの前兆｜後半のσ_LOTが前半の0.5倍未満）",u"規則的に上下を繰り返している（振動｜上下交互が14点以上連続）"
@@ -483,20 +572,35 @@ do=[cf,cg,ch,ci,cj,ck,cl]
 dp=[dq for dq in ImageCodecInfo.GetImageEncoders() if dq.FormatID==ImageFormat.Jpeg.Guid][0]
 dr=EncoderParameters(1); dr.Param[0]=EncoderParameter(Encoder.Quality,y)
 
-ds={}   # 前回状態 prev[key]="OK;NG;係数;MA;継続回数;水位線ticks;更新した実行時刻ticks"   #▲修正2/7
-try:
-    dt=a[aq]
-    if dt:
-        for du in dt.split(u"\n"):
-            if u"=" in du: cc,bt=du.rsplit(u"=",1); ds[cc]=bt
-except: ds={}
+ds={}   # 前回状態 prev[key]="OK;NG;係数;MA;継続回数;水位線;更新した実行時刻"   #▲修正2/7
+#===== ▲修正13 ここから ===== 読み込みをV1/V2両対応にし、破損を握りつぶさず件数を出す
+#★旧| try:
+#★旧|     dt=a[aq]
+#★旧|     if dt:
+#★旧|         for du in dt.split(u"\n"):
+#★旧|             if u"=" in du: cc,bt=du.rsplit(u"=",1); ds[cc]=bt
+#★旧| except: ds={}
+dt=kl(); kb=0
+if dt is None:
+    print "WARN 前回状態を読み出せませんでした（保存先の設定/権限を確認してください）"   #▲修正13
+    print "WARN このまま進むと全keyが『初登場＝全期間集計』になり、過去分をすべて今回分として報告します"
+else:
+    ds,kb=kr(dt)
+    print "状態: 読込%d件 / 解析できなかった行%d / 元テキスト%d文字"%(len(ds),kb,len(dt))
+    if kb: print "WARN 前回状態に壊れた行が%d行あります（容量超過による切り捨て・区切り文字の混入を疑ってください）"%kb
+kc2=len([1 for cc in ds if bs(ds[cc]) is None])
+if kc2: print "WARN OK/NG数として解釈できない状態が%d件あります（該当keyは悪化・改善の比較から外れます）"%kc2   #▲修正13
+#===== ▲修正13 ここまで =====
 if aj and an: ds={u"工程A|膜厚|STEP\x1f装置Ach1":u"40;2;3.0;30"}; print "TEST前回固定"
 dv={}
 #===== ▲修正2 ここから ===== 状態の6番目「水位線」7番目「更新した実行時刻」を読み出す
-def ja(bt,db=5):   # 状態文字列のdb番目(ticks)→DateTime。無い/壊れている場合はNone   #▲修正2
+def ja(bt,db=5):   # 状態文字列のdb番目→DateTime。無い/壊れている場合はNone   #▲修正2
     try:
         bu=bt.split(u";")
-        if len(bu)>db and bu[db].strip(): return DateTime(Int64.Parse(bu[db].strip()))
+        if len(bu)>db and bu[db].strip():
+            bp=bu[db].strip()
+            if len(bp)>=15 and bp.isdigit(): return DateTime(Int64.Parse(bp))   # 旧: .NET ticks   #▲修正13
+            return k7(bp)                                                        # 新: base36秒   #▲修正13
     except: pass
     return None
 jc={}   # key→水位線。これ以前の加工日時の行は「既に配信済み」として二度と数えない   #▲修正2
@@ -510,6 +614,7 @@ for cc in ds:
 # 「ds全件」ではなく「前回の配信で実際に掲載されたkey」だけを前回値として扱う。
 jx=set(cc for cc in ds if ja(ds[cc],6)==ep) if ep is not None else set(ds)   #▲修正7
 jm={}; jl={}   # jm=今回数えた最新加工日時(次回の水位線) / jl=今回の新規判定行数   #▲修正2
+ka={}          # key→[全期間OK,全期間NG]。グラフ(全期間表示)との突き合わせ用の参考値。判定には一切使わない   #▲修正14
 jr={"skip":0,"old":0,"unk":0}   # 診断カウンタ   #▲修正10
 print "DBG 前回状態=%d件 / 水位線あり=%d件 / 前回掲載=%d件 (%s)"%(len(ds),len(jc),len(jx),u"通常運転" if jc else u"初回or移行回")   #▲修正10
 #===== ▲修正2 ここまで =====
@@ -562,18 +667,23 @@ for ee in be:
 #★旧|             if eo in ds:
 #★旧|                 ep=eh.get(ej,None)
 #★旧|                 if ep is None or dc<ep.Subtract(di): continue      ←ch相対の窓＝二重計上の原因
-            jk=jc.get(eo)
-            if jb and jk is not None:
-                if dc<=jk: ji+=1; continue              # ★既報行：ロット遡及で再取得されても数えない   #▲修正3
-            elif eo in ds:
-                if dc<jd.Subtract(di): je+=1; continue  # 水位線が無い既存key＝移行回。実行時刻からn日   #▲修正3
-            # 上記いずれにも当たらない＝初登場key → 全期間（従来どおり）
+#===== ▲修正14 ここから ===== 判定値の読み取りを期間フィルタより前に出し、全期間の参考値を同じ1パスで取る
             az=bh.CurrentValue
             if az in (None,""): continue
             az=unicode(az).strip().upper()              # 前後空白・大小文字の揺れを吸収   #▲修正5
             if   az in (u"NG",u"ＮＧ",u"×",u"NG判定"): az=u"NG"
             elif az in (u"OK",u"ＯＫ",u"○",u"◯",u"OK判定"): az=u"OK"
             else: jj+=1; continue                       # OK/NGどちらでもない値は数えず件数だけ記録   #▲修正5
+            ay=ka.get(eo)
+            if ay is None: ay=[0,0]; ka[eo]=ay
+            ay[1 if az==u"NG" else 0]+=1                # 全期間(参考値)。期間フィルタを一切かけない   #▲修正14
+#===== ▲修正14 ここまで =====
+            jk=jc.get(eo)
+            if jb and jk is not None:
+                if dc<=jk: ji+=1; continue              # ★既報行：ロット遡及で再取得されても数えない   #▲修正3
+            elif eo in ds:
+                if dc<jd.Subtract(di): je+=1; continue  # 水位線が無い既存key＝移行回。実行時刻からn日   #▲修正3
+            # 上記いずれにも当たらない＝初登場key → 全期間（従来どおり）
             el+=1
             if az==u"NG": ek+=1; em[ej]=em.get(ej,0)+1
             else: en[ej]=en.get(ej,0)+1
@@ -690,8 +800,12 @@ for ee in be:
                     if jl.get(eo,0)>0:
                         fs=u'%s ／ %s ／ <span style="color:green">OK %d</span> ・ <span style="color:#c0392b">NG %d</span> ・ 母数 %d ／ NG率 %.2f%% ／ <span style="color:#888">[%s]</span>'%(bo(ee),bo(fm),fp,fq,fp+fq,fr,ec.get(eo,u"初回(全期間)"))
                     else:
-                        fs=u'%s ／ %s ／ <span style="color:#888">今回の新規データなし（推移パターン検出のため掲載／グラフは全期間表示）</span>'%(bo(ee),bo(fm))
+                        fs=u'%s ／ %s ／ <span style="color:#888">今回の新規データなし（推移パターン検出のため掲載）</span>'%(bo(ee),bo(fm))
 #===== ▲修正9 ここまで =====
+#===== ▲修正14 ここから ===== グラフ1枚ごとに「全期間の同じ集計」を毎回併記（参考値・判定には不使用）
+                    ay=ka.get(eo,[0,0])
+                    fs+=u'<br><span style="color:#666;font-weight:normal">全期間（このグラフ全体・参考値／集計や判定には使用していません）：OK %d ・ NG %d ・ 母数 %d ／ NG率 %.2f%%</span>'%(ay[0],ay[1],ay[0]+ay[1],bv(ay[0],ay[1]))   #▲修正14
+#===== ▲修正14 ここまで =====
                     eb.append((fr,ee,fl,fp,fq,d(au,fo),fo))
                 else: fs=u"%s ／ %s"%(bo(ee),bo(fm))
                 fh.append(u'<p class="lbl">%s</p><img src="img/%s"/>'%(fs,bo(fo)))
@@ -750,14 +864,22 @@ def jy(cc):   # 保存用の状態文字列 "OK;NG;係数;MA;継続回数;水位
         bu[6]=u"%d"%jd.Ticks                                  # 今回の配信で掲載したkeyの印
     bd=ih.get(cc,{})
     bu[4]=u",".join(u"%d:%d"%(db,bd[db]) for db in sorted(bd)) if bd else u""
-    if cc in jm: bu[5]=u"%d"%jm[cc].Ticks                     # 水位線は今回数えた最新加工日時へ前進
+    if cc in jm: bu[5]=k6(jm[cc])                             # 水位線は今回数えた最新加工日時へ前進   #▲修正13
     return u";".join(bu[:7])
 jn=dict(ds)
 for cc in (set(ds)|set(dv)): jn[cc]=jy(cc)
-if not (aj and ao):
-#★旧|     a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in dv.items())
-    a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in jn.items())   #▲修正7
-    print "DBG 状態保存=%d件（今回更新%d件 / 持ち越し%d件）"%(len(jn),len(dv),len(jn)-len(dv))   #▲修正10
+#===== ▲修正15 ここから ===== 直列化だけ先に済ませ、実際の書き込みは配信が成功してから行う
+#★旧| if not (aj and ao):
+#★旧|     a[aq]=u"\n".join(u"%s=%s"%(cc,az) for cc,az in jn.items())
+#  なぜ分けるか: 状態を先に書くと、メール送信に失敗した週の行が「集計済み」として記録され、
+#  その週のNG・悪化・新規が二度と報告されなくなる。配信の成功を確認してから確定させる。
+kv,kn,kf=kw(jn)   # kv=保存するテキスト / kn=採用件数 / kf=失効で捨てた件数   #▲修正15
+print "DBG 状態: 保存予定%d件（今回更新%d / 持ち越し%d / 失効破棄%d）／ %d文字"%(kn,len(dv),kn-len(dv),kf,len(kv))   #▲修正15
+def kq():   # 状態の確定（配信が成立した後にだけ呼ぶ）   #▲修正15
+    if aj and not ao:
+        print "TEST実行のため状態は保存しません（保存したい場合は ao=True）"; return   #▲修正12
+    print "状態を保存しました → %s / %d件 %d文字"%(kp(kv),kn,len(kv))
+#===== ▲修正15 ここまで =====
 #===== ▲修正7 ここまで =====
 
 ft={}; ju={}
@@ -897,12 +1019,13 @@ hp=(u'<!DOCTYPE html><meta charset="utf-8"><style>%s</style><h1>NG率レポー�
 hq=StreamWriter(d(at,"ng_report.html"),False,Encoding.UTF8); hq.Write(hp); hq.Close()
 
 hq=StreamWriter(d(at,"ng_summary.csv"),False,Encoding.GetEncoding("shift_jis"))
-hq.WriteLine("項目,装置ch,OK,NG,NG率(%),集計")
+#★旧| hq.WriteLine("項目,装置ch,OK,NG,NG率(%),集計")
+hq.WriteLine("項目,装置ch,OK,NG,NG率(%),集計,全期間OK,全期間NG,全期間NG率(%)")   #▲修正14
 for cc in dv:
     fy=bs(dv[cc])
     if fy is None: continue
-    fu,fv=cb(cc)
-    hq.WriteLine(u"%s,%s,%d,%d,%.2f,%s"%(fu,fv,fy[0],fy[1],bv(fy[0],fy[1]),ec.get(cc,u"")))
+    fu,fv=cb(cc); ay=ka.get(cc,[0,0])
+    hq.WriteLine(u"%s,%s,%d,%d,%.2f,%s,%d,%d,%.2f"%(fu,fv,fy[0],fy[1],bv(fy[0],fy[1]),ec.get(cc,u""),ay[0],ay[1],bv(ay[0],ay[1])))   #▲修正14
 hq.Close()
 
 def hr(fo,fw,hs): return u"img/"+bo(fo)
@@ -962,10 +1085,29 @@ if (not aj) and am:
     hy=AlternateView.CreateAlternateViewFromString(hx,None,MediaTypeNames.Text.Html)
     for hw in hu: hy.LinkedResources.Add(hw)
     co.AlternateViews.Add(hy); hz=Attachment(ht); co.Attachments.Add(hz)
-    try: SmtpClient(ab,ac).Send(co)
-    finally:   # BUG?: 解放しないとファイル掴んで消せない
+#===== ▲修正15 ここから ===== 送信成功時だけ「状態の確定」と「成果物の削除」を行う
+#★旧|     try: SmtpClient(ab,ac).Send(co)
+#★旧|     finally:   # BUG?: 解放しないとファイル掴んで消せない
+#★旧|         hz.Dispose(); co.Dispose()
+#★旧|         try: Directory.Delete(at,True)
+#★旧|         except: pass
+#★旧|         try: File.Delete(ht)
+#★旧|         except: pass
+#  旧実装は finally で削除していたため、送信に失敗しても成果物が消え、再送も検証もできなかった。
+    try:
+        SmtpClient(ab,ac).Send(co)
+    except Exception,bb:
         hz.Dispose(); co.Dispose()
-        try: Directory.Delete(at,True)
-        except: pass
-        try: File.Delete(ht)
-        except: pass
+        print "ERROR メール送信に失敗しました:",bb
+        print "ERROR 状態は保存していません。この週の分は次回の実行で再集計されます"
+        print "ERROR 成果物は削除せず残しました:",ht
+        raise                                   # ジョブを失敗扱いにして気づけるようにする
+    hz.Dispose(); co.Dispose()   # BUG?: 解放しないとファイル掴んで消せない
+    kq()                         # ←配信が成立してから水位線を確定
+    try: Directory.Delete(at,True)
+    except: pass
+    try: File.Delete(ht)
+    except: pass
+else:
+    kq()                         # 送信しない構成（TEST/送信無効）は成果物の生成完了をもって確定
+#===== ▲修正15 ここまで =====
