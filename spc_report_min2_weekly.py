@@ -56,6 +56,8 @@
 #     読めなかった回は不問とし、全keyを初回（全期間集計）として続行する
 # 18  コード履歴からコード全体の複製を廃止。台帳に「変更前／変更後の行」だけを追記する
 #     （code_changes.tsv）。履歴フォルダのファイルは4つ固定で増え続けない
+# 19  状態ファイルの圧縮をやめ、日時も項目名もそのまま書くV3形式に（見出し行つきタブ区切り）。
+#     毎回上書きの1ファイルなので容量の制約が無く、Excelでそのまま開いて中身を確認できる
 # ================================================================================
 # SPC NG率レポート 自動配信（最短化版）。動作は spc_report_integrated.py と同一。
 #===== ★変更1 ここから ===== ヘッダの期間説明を新仕様(NG率8日/ルール30日/画像全期間)に差替
@@ -345,7 +347,8 @@ from System.IO import Directory,Path,File,StreamWriter
 from System.IO.Compression import ZipFile
 from System.Text import Encoding
 #★旧| from System import String,DateTime,TimeSpan,Double
-from System import String,DateTime,TimeSpan,Double,Int64   # Int64=水位線(ticks)の復元用   #▲修正2
+from System import String,DateTime,TimeSpan,Double,Int64   # Int64=旧形式(ticks)の復元用   #▲修正2
+from System.Globalization import CultureInfo   # 日時の書式を地域設定に左右されないようにする   #▲修正19
 from System.Threading import Thread
 from Spotfire.Dxp.Application.Visuals import VisualContent
 from Spotfire.Dxp.Data import DataValueCursor,DataPropertyClass
@@ -609,54 +612,66 @@ def jv(cc): return cc.replace(u" ",u"").replace(u"\u3000",u"").replace(u"-",u"")
 import math
 
 #===== ▲修正13 ここから ===== 状態のコーデック（V2形式）と入出力
-# 【なぜ形式を変えるか】旧形式は1keyあたり「項目名(長い)+OK;NG;係数;MA;継続;ticks(19桁);ticks(19桁)」で
-#   100文字前後になり、文書プロパティの容量を圧迫していた。V2は
-#     ・項目名を番号化してヘッダに1回だけ書く
-#     ・日時を2000-01-01起点の秒のbase36（6文字）にする
-#   ことで1keyあたり40文字前後に縮む（約6割減）。内部表現は従来のまま（";"区切り7フィールド）なので
-#   集計・比較のコードには一切手を入れていない。読み込みは旧形式(V1)も受け付ける。
+# 【保存形式V3】見出し行つきのタブ区切り。1行＝1つの「項目×装置ch」で、日時も項目名もそのまま書く。
+#   Excelにドラッグすればそのまま表として開ける。毎回上書きする1ファイルなので容量を気にする必要はない。
+#   内部表現は従来のまま（";"区切り7フィールド）なので集計・比較のコードには一切手を入れていない。
+#   読み込みは旧V2（項目番号＋base36日時）・旧V1（key=値の行形式）も受け付け、保存時にV3へ揃える。
 # ┌─【区分】状態のコーデック（保存形式V2） ──────────────────────────────
-# │ ke=base36の基点(2000-01-01)  k3=base36の文字表  k6()=DateTime→base36秒  k7()=その逆
-# │ kd()=区切り文字のサニタイズ  kr()=テキスト→内部辞書(+壊れた行数)  kw()=内部辞書→V2テキスト(+失効)
+# │ k6()=DateTime→"yyyy-MM-dd HH:mm:ss"(秒未満は切上げ)  k7()=その逆  k8()=旧base36の読込  ke/k3=旧形式用
+# │ kd()=区切り文字のサニタイズ  kH=V3の見出し行  kr()=テキスト→内部辞書(+壊れた行数)  kw()=内部辞書→V3テキスト(+失効)
 # │ kl()=状態ファイルの読み込み(読めなければNone＝全key初回扱い)   kp()=状態ファイルへの書き込み(一時ファイル経由)
 # └──────────────────────────────────────────────────────────────────────────
-ke=DateTime(2000,1,1); k3=u"0123456789abcdefghijklmnopqrstuvwxyz"
-def k6(dc):   # DateTime→base36秒。水位線が実時刻より前に戻らないよう切り上げる（＝既報を数え直さない）
-    bd=int(math.ceil(dc.Subtract(ke).TotalSeconds))
-    if bd<0: bd=0
-    bp=u""
-    while bd>0: bp=k3[bd%36]+bp; bd=bd//36
-    return bp or u"0"
-def k7(bp):   # base36秒→DateTime
+#===== ▲修正19 ここから ===== 上書き保存が前提になったので、圧縮をやめて素直な表記にする
+# 日時のbase36化と項目名の番号化は、文書プロパティの容量制限を避けるための措置だった。
+# 保存先が「毎回上書きする1つのファイル」になった今は容量の制約が無いので、
+# 日時は "yyyy-MM-dd HH:mm:ss"、項目名はそのまま書く。見出し行つきのタブ区切りなので
+# Excelにドラッグすればそのまま表として読める。旧形式(V2=base36 / V1=key形式)も読み込める。
+ke=DateTime(2000,1,1); k3=u"0123456789abcdefghijklmnopqrstuvwxyz"   # 旧V2(base36)の読み込みにだけ使う
+def k6(dc):   # DateTime→"yyyy-MM-dd HH:mm:ss"。秒未満は切り上げる（水位線が前に戻ると既報を数え直すため）
+    bd=dc.Ticks%10000000
+    if bd>0: dc=dc.AddTicks(10000000-bd)
+    return dc.ToString(u"yyyy-MM-dd HH:mm:ss")
+def k7(bp):   # "yyyy-MM-dd HH:mm:ss"→DateTime
+    return DateTime.ParseExact(bp,u"yyyy-MM-dd HH:mm:ss",CultureInfo.InvariantCulture)
+def k8(bp):   # 旧V2のbase36秒→DateTime（移行のためだけに残す）
     bd=0
     for br in bp: bd=bd*36+k3.index(br)
     return ke.AddSeconds(bd)
-def kd(bp):   # 区切り文字の混入で状態が壊れるのを防ぐ（B5対策）
-    return bp.replace(u"\t",u" ").replace(u"\r",u"").replace(u"\n",u" ").replace(u"=",u"＝").replace(u";",u"；")
+def kd(bp):   # 区切り文字の混入で状態が壊れるのを防ぐ（B5対策）。V3はタブ区切りなので"="は加工しない
+    return bp.replace(u"\t",u" ").replace(u"\r",u"").replace(u"\n",u" ").replace(u";",u"；")
+#===== ▲修正19 ここまで =====
+kH=[u"項目",u"装置ch",u"OK",u"NG",u"σ係数",u"MA",u"継続回数",u"水位線",u"更新実行時刻"]   # V3の見出し行   #▲修正19
 def kr(bt):   # テキスト→内部辞書{key:"OK;NG;係数;MA;継続;水位線;更新"} + 壊れた行数
-    ct={}; ci={}; bd=0
+    ct={}; ci={}; bd=0; bp2=u"V1"
     if not bt: return ct,0
     for du in bt.split(u"\n"):
         du=du.strip(); du=du.strip(u"\r")
         if not du: continue
+        if du[:3]==u"#V3": bp2=u"V3"; continue
+        if du[:3]==u"#V2": bp2=u"V2"; continue
         if du[:2]==u"#V": continue
-        if du[:2]==u"#I":
+        if du[:2]==u"#I":                    # 旧V2の項目辞書
             bu=du.split(u"\t")
             if len(bu)>=2: ci[bu[0][2:]]=bu[1]
             else: bd+=1
             continue
-        if u"\t" in du:                      # V2行: idx,ch,OK,NG,係数,MA,継続,水位線,更新
+        if bp2==u"V3":                       # V3行: 項目,装置ch,OK,NG,係数,MA,継続,水位線,更新   #▲修正19
+            bu=du.split(u"\t")
+            if bu[0]==kH[0]: continue        # 見出し行は読み飛ばす
+            if len(bu)<9 or not bu[0]: bd+=1; continue
+            ct[bz(bu[0],bu[1])]=u";".join(bu[2:9])
+        elif bp2==u"V2":                     # 旧V2行: 項目番号,装置ch,...
             bu=du.split(u"\t")
             if len(bu)<9 or bu[0] not in ci: bd+=1; continue
             ct[bz(ci[bu[0]],bu[1])]=u";".join(bu[2:9])
-        elif u"=" in du:                     # V1行(旧形式・移行用)
+        elif u"=" in du:                     # 旧V1行
             cc,bp=du.rsplit(u"=",1)
             if len(bp.split(u";"))<2 or not cc: bd+=1; continue
             ct[cc]=bp
         else: bd+=1
     return ct,bd
-def kw(ct):   # 内部辞書→V2テキスト（失効を適用）。戻り値=(テキスト,採用件数,失効件数)
-    ci={}; co2=[]; bd=0
+def kw(ct):   # 内部辞書→V3テキスト（失効を適用）。戻り値=(テキスト,採用件数,失効件数)   #▲修正19
+    co2=[]; bd=0
     for cc in sorted(ct):
         try: fu,fv=cb(cc)
         except: continue
@@ -664,10 +679,11 @@ def kw(ct):   # 内部辞書→V2テキスト（失効を適用）。戻り値=(
         if kt and ep2 is not None and ep2<jd.AddDays(-kt): bd+=1; continue   # 失効
         bu=ct[cc].split(u";")
         while len(bu)<7: bu.append(u"")
-        fu=kd(fu); fv=kd(fv)
-        if fu not in ci: ci[fu]=unicode(len(ci))
-        co2.append(u"\t".join([ci[fu],fv]+[kd(ba) for ba in bu[:7]]))
-    bp=[u"#V2"]+[u"#I%s\t%s"%(ci[fu],fu) for fu in sorted(ci,key=lambda ba:int(ci[ba]))]+co2
+        for db in (5,6):                     # 旧形式(ticks/base36)で持ち越したkeyもここで通常表記に揃える
+            ep3=ja(ct[cc],db)
+            bu[db]=k6(ep3) if ep3 is not None else u""
+        co2.append(u"\t".join([kd(fu),kd(fv)]+[kd(ba) for ba in bu[:7]]))
+    bp=[u"#V3",u"\t".join(kH)]+co2
     return u"\n".join(bp),len(co2),bd
 #★旧| def kl(): ... ファイル→文書プロパティ の順で読む／def kp(bt): ... 失敗時は文書プロパティへ退避
 #  ▲修正17: 文書プロパティへの保存を廃止し、状態ファイル ks 一本に統一。   #▲修正17
@@ -806,8 +822,9 @@ def ja(bt,db=5):   # 状態文字列のdb番目→DateTime。無い/壊れてい
         bu=bt.split(u";")
         if len(bu)>db and bu[db].strip():
             bp=bu[db].strip()
-            if len(bp)>=15 and bp.isdigit(): return DateTime(Int64.Parse(bp))   # 旧: .NET ticks   #▲修正13
-            return k7(bp)                                                        # 新: base36秒   #▲修正13
+            if u"-" in bp: return k7(bp)                                         # 新: yyyy-MM-dd HH:mm:ss   #▲修正19
+            if len(bp)>=15 and bp.isdigit(): return DateTime(Int64.Parse(bp))    # 旧: .NET ticks   #▲修正13
+            return k8(bp)                                                        # 旧: base36秒   #▲修正19
     except: pass
     return None
 jc={}   # key→水位線。これ以前の加工日時の行は「既に配信済み」として二度と数えない   #▲修正2
