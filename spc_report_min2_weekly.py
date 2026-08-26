@@ -46,6 +46,14 @@
 #  8  画像の描画対象を jo に一本化／トレリス頁名→ch の解決を正規化マッチ化
 #  9  画像ラベル・本文・詳細HTML・完了ログの期間表記を新仕様に差替
 # 10  診断print（既報スキップ件数／未知判定値／掲載ch数 ほか）
+# 11  グラフ1枚ごとに「全期間の同じ集計」を参考値として毎回併記（判定には不使用）
+# 12  TEST実行では既定で状態を保存しない（ao の意味を反転）
+# 13  状態の保存形式をV2に圧縮（項目名の番号化＋日時のbase36化。約半分）
+# 14  判定値の読み取りを期間フィルタより前に出し、全期間の集計を同じ1パスで取る
+# 15  状態の確定を配信成功後に移動。送信失敗時は保存せず成果物も残す
+# 16  実行のたびにコード版数を記録し、変わっていれば差分を出力（コード履歴）
+# 17  前回状態の保存先を状態ファイル ks 一本に統一（文書プロパティへの保存を廃止）。
+#     読めなかった回は不問とし、全keyを初回（全期間集計）として続行する
 # ================================================================================
 # SPC NG率レポート 自動配信（最短化版）。動作は spc_report_integrated.py と同一。
 #===== ★変更1 ここから ===== ヘッダの期間説明を新仕様(NG率8日/ルール30日/画像全期間)に差替
@@ -99,7 +107,7 @@
 # an  = TEST:前回状態を固定
 # ao  = TEST:状態を保存しない
 # ap  = テスト出力先フォルダ
-# aq  = 前回状態プロパティ名
+# aq  = 前回状態プロパティ名 ←▲修正17で廃止（状態は ks のファイルにのみ保存）
 # ar  = 出力ルート(TEST_DIR/Temp)
 # at  = 実行フォルダ(run_日時)
 # au  = 画像フォルダ
@@ -356,7 +364,7 @@ e=Thread.Sleep                # 待機(ms)
 # │ 画像   w,x=画像の幅高  y=JPEG品質
 # │ 配信   z=送信元  aa=送信先  ab=SMTPサーバ  ac=SMTPポート
 # │ モード aj=TEST  ak=NGページのみ  al=差分のみ  am=送信可否  an=TEST:前回状態を固定  ao=TEST:状態を保存する
-# │ 保存   ap=TEST出力先  aq=文書プロパティ名  ks=状態ファイル  kt=失効日数  kh/kj/kc=コード履歴の設定
+# │ 保存   ap=TEST出力先  ks=状態ファイル(必須)  kt=失効日数  kh/kj/kc=コード履歴の設定  ※文書プロパティ保存は廃止
 # └──────────────────────────────────────────────────────────────────────────
 f="データ"; g="＜判定列名＞"; h="004_Gr_1"; i="項目1"; j="＜グラフ名＞"
 k="SIGMA_K"; l="MA_N"
@@ -374,7 +382,8 @@ af=10; ag=10; ah=10
 ai=0.0
 aj=True; ak=True; al=False; am=True
 an=False; ao=False
-ap=r"C:\Users\＜自分＞\Desktop\spc_test"; aq="SPC_PrevState"
+#★旧| ap=r"C:\Users\＜自分＞\Desktop\spc_test"; aq="SPC_PrevState"
+ap=r"C:\Users\＜自分＞\Desktop\spc_test"   # aq(文書プロパティ名)は▲修正17で廃止。状態は ks のファイルにのみ保存する   #▲修正17
 #★旧| ao=False   # 旧仕様:「TEST時に状態を保存しない」フラグ（既定Falseなので保存されていた）
 #  ▲修正12: 意味を反転。既定(False)ではTEST実行時に状態を保存しない。   #▲修正12
 #           TESTで水位線を進めて本番配信分を食う事故を既定で防ぐ。連続テストで保存したいときだけTrue。
@@ -384,8 +393,9 @@ jb=True           # True=既報行を水位線で除外（推奨） / False=旧�
 #===== ▲修正1 ここまで =====
 #===== ▲修正13 ここから ===== 状態の保存先（文書プロパティの容量制限を回避）
 # ks に書き込み可能なパスを入れると、前回状態をそのテキストファイルに保存する（文書プロパティは使わない）。
-# 空文字なら従来どおり文書プロパティ aq に保存。ファイル方式ならSpotfire Serverへの負荷はゼロ、容量制限も無い。
-# 複数ノードでジョブが動く場合は、必ずUNC共有など全ノードから見える場所を指定すること。
+# ★必須設定★ 文書プロパティへの保存は廃止したので、ここが空だと前回状態を持ち越せず、
+# 毎回すべてのkeyが初回（全期間集計）になる。Spotfire Serverへの負荷はゼロ、容量制限も無い。
+# 複数ノードでジョブが動く場合は、必ずUNC共有など全ノードから見える場所を指定すること。   #▲修正17
 ks=u""            # 例: ur"\\＜サーバ＞\＜共有＞\spc\spc_state.txt"   #▲修正13
 kt=180            # 状態の失効日数。この日数更新の無いkeyは保存時に捨てる（0で無効）   #▲修正13
 #===== ▲修正13 ここまで =====
@@ -561,7 +571,7 @@ import math
 # ┌─【区分】状態のコーデック（保存形式V2） ──────────────────────────────
 # │ ke=base36の基点(2000-01-01)  k3=base36の文字表  k6()=DateTime→base36秒  k7()=その逆
 # │ kd()=区切り文字のサニタイズ  kr()=テキスト→内部辞書(+壊れた行数)  kw()=内部辞書→V2テキスト(+失効)
-# │ kl()=読み込み元の選択(ファイル→文書プロパティ)   kp()=書き込み先の選択(ファイル→失敗時は文書プロパティ)
+# │ kl()=状態ファイルの読み込み(読めなければNone＝全key初回扱い)   kp()=状態ファイルへの書き込み(一時ファイル経由)
 # └──────────────────────────────────────────────────────────────────────────
 ke=DateTime(2000,1,1); k3=u"0123456789abcdefghijklmnopqrstuvwxyz"
 def k6(dc):   # DateTime→base36秒。水位線が実時刻より前に戻らないよう切り上げる（＝既報を数え直さない）
@@ -612,27 +622,39 @@ def kw(ct):   # 内部辞書→V2テキスト（失効を適用）。戻り値=(
         co2.append(u"\t".join([ci[fu],fv]+[kd(ba) for ba in bu[:7]]))
     bp=[u"#V2"]+[u"#I%s\t%s"%(ci[fu],fu) for fu in sorted(ci,key=lambda ba:int(ci[ba]))]+co2
     return u"\n".join(bp),len(co2),bd
-def kl():     # 状態の読み込み元: ファイル→文書プロパティ の順
-    bt=None
-    if ks:
-        try:
-            if File.Exists(ks): bt=File.ReadAllText(ks,Encoding.UTF8); print "状態: ファイルから読込 %s"%ks
-        except Exception,bb: print "WARN 状態ファイルの読込に失敗:",bb
-    if bt is None:
-        try: bt=a[aq]
-        except Exception,bb: print "WARN 文書プロパティの読込に失敗:",bb; bt=None
-    return bt
-def kp(bt):   # 状態の書き込み先: ファイル（一時ファイル経由で壊さない）→ 失敗時は文書プロパティ
-    if ks:
-        try:
-            bp=Path.GetDirectoryName(ks)
-            if bp and not Directory.Exists(bp): Directory.CreateDirectory(bp)
-            File.WriteAllText(ks+u".tmp",bt,Encoding.UTF8)
-            if File.Exists(ks): File.Delete(ks)
-            File.Move(ks+u".tmp",ks)
-            return u"ファイル(%s)"%ks
-        except Exception,bb: print "WARN 状態ファイルの書込に失敗→文書プロパティへ退避:",bb
-    a[aq]=bt; return u"文書プロパティ(%s)"%aq
+#★旧| def kl(): ... ファイル→文書プロパティ の順で読む／def kp(bt): ... 失敗時は文書プロパティへ退避
+#  ▲修正17: 文書プロパティへの保存を廃止し、状態ファイル ks 一本に統一。   #▲修正17
+#    読み書きの先が食い違って水位線が巻き戻る経路（古いファイル＋新しいプロパティ）を根から断つ。
+#    読めなかった場合は「前回状態なし」＝全keyを初回扱い（全期間集計）として続行する。
+def kl():     # 状態の読み込み: 状態ファイルのみ。読めなければ None（＝全key初回扱い）   #▲修正17
+    if not ks:
+        print "WARN 状態ファイル ks が未設定です。前回状態を使わず、全keyを初回（全期間集計）として処理します"
+        return None
+    try:
+        if not File.Exists(ks):
+            print "状態: ファイルが未作成です（初回実行 or 保存先の変更）→ 全keyを初回として処理します: %s"%ks
+            return None
+        bt=File.ReadAllText(ks,Encoding.UTF8)
+        print "状態: ファイルから読込 %s"%ks
+        return bt
+    except Exception,bb:
+        print "WARN 状態ファイルの読込に失敗→全keyを初回として処理します:",bb
+        return None
+def kp(bt):   # 状態の書き込み: 状態ファイルのみ。一時ファイル経由で置換するので途中終了でも壊れない   #▲修正17
+    if not ks:
+        print "ERROR 状態ファイル ks が未設定のため保存できません（次回も全keyが初回扱いになります）"
+        return u"保存先なし"
+    try:
+        bp=Path.GetDirectoryName(ks)
+        if bp and not Directory.Exists(bp): Directory.CreateDirectory(bp)
+        File.WriteAllText(ks+u".tmp",bt,Encoding.UTF8)
+        if File.Exists(ks): File.Delete(ks)
+        File.Move(ks+u".tmp",ks)
+        return u"ファイル(%s)"%ks
+    except Exception,bb:
+        print "ERROR 状態ファイルの書込に失敗:",bb
+        print "ERROR 今回の水位線は記録されていません。次回は全keyが初回（全期間集計）になります: %s"%ks
+        return u"保存失敗"
 #===== ▲修正13 ここまで =====
 
 # ┌─【区分】推移パターンの判定 ────────────────────────────────────────────
@@ -720,8 +742,8 @@ ds={}   # 前回状態 prev[key]="OK;NG;係数;MA;継続回数;水位線;更新�
 #★旧| except: ds={}
 dt=kl(); kb=0
 if dt is None:
-    print "WARN 前回状態を読み出せませんでした（保存先の設定/権限を確認してください）"   #▲修正13
-    print "WARN このまま進むと全keyが『初登場＝全期間集計』になり、過去分をすべて今回分として報告します"
+    print "状態: 前回状態なし → 全keyを初回（全期間集計）として処理します"   #▲修正17
+    print "      このため今回は母数が大きく、『新規発生』も多く出ます（異常ではありません）"
 else:
     ds,kb=kr(dt)
     print "状態: 読込%d件 / 解析できなかった行%d / 元テキスト%d文字"%(len(ds),kb,len(dt))
@@ -1041,7 +1063,9 @@ print "DBG 状態: 保存予定%d件（今回更新%d / 持ち越し%d / 失効�
 def kq():   # 状態の確定（配信が成立した後にだけ呼ぶ）   #▲修正15
     if aj and not ao:
         print "TEST実行のため状態は保存しません（保存したい場合は ao=True）"; return   #▲修正12
-    print "状態を保存しました → %s / %d件 %d文字"%(kp(kv),kn,len(kv))
+    bp=kp(kv)
+    if bp in (u"保存先なし",u"保存失敗"): print "状態: 保存できませんでした（%s）"%bp   #▲修正17
+    else: print "状態を保存しました → %s / %d件 %d文字"%(bp,kn,len(kv))
 #===== ▲修正15 ここまで =====
 #===== ▲修正7 ここまで =====
 
