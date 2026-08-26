@@ -54,6 +54,8 @@
 # 16  実行のたびにコード版数を記録し、変わっていれば差分を出力（コード履歴）
 # 17  前回状態の保存先を状態ファイル ks 一本に統一（文書プロパティへの保存を廃止）。
 #     読めなかった回は不問とし、全keyを初回（全期間集計）として続行する
+# 18  コード履歴からコード全体の複製を廃止。台帳に「変更前／変更後の行」だけを追記する
+#     （code_changes.tsv）。履歴フォルダのファイルは4つ固定で増え続けない
 # ================================================================================
 # SPC NG率レポート 自動配信（最短化版）。動作は spc_report_integrated.py と同一。
 #===== ★変更1 ここから ===== ヘッダの期間説明を新仕様(NG率8日/ルール30日/画像全期間)に差替
@@ -418,9 +420,12 @@ au=d(at,"img"); Directory.CreateDirectory(au)
 # ┌─【区分】コード履歴 ────────────────────────────────────────
 # │ kg()=本文のSHA1先頭12桁（＝版数）      kk()=スクリプト本文の取得（戻り: 本文, 取得経路）
 # │ km()=版数の判定・差分作成・履歴追記    kz=メール等に出す版数表示   ky=今回の差分テキスト
-# │ 出力先(kh または 出力ルート\code_history):
-# │   latest.py … 直近の本文  code_日時_版数.py … 版ごとのスナップショット
-# │   diff_日時.txt … 前版との差分(unified) code_history.tsv … 1実行1行の履歴台帳
+# │ kT()=TSVセル用の整形   kE()=変更前/変更後の対応表を作る   kM=明細の1実行あたり上限
+# │ 出力先(kh または 出力ルート\code_history)。ファイルは4つだけで、増え続けない:
+# │   code_history.tsv  … 1実行1行の要約台帳（変更があった回だけ追記）
+# │   code_changes.tsv  … 1変更1行の明細台帳（種別・旧行・新行・変更前・変更後）★履歴の本体
+# │   latest.py         … 次回の比較に使う土台。毎回上書き（版ごとの複製は残さない）
+# │   latest_diff.txt   … 直近の差分(unified)。毎回上書き
 # │   変更があった回は 実行フォルダにも code_diff.txt を置くので添付zipで配布される
 # └──────────────────────────────────────────────────────
 try:   # 差分生成。difflibが無い環境でも履歴が止まらないよう簡易版を用意する
@@ -436,6 +441,36 @@ except ImportError:
             if du not in s2: bp.append(u"-%d: %s"%(db,du))
         return u"\n".join(bp)
 from System.Security.Cryptography import SHA1
+#===== ▲修正18 ここから ===== コード全体の複製をやめ、台帳に「変更前／変更後の行」だけを残す
+kM=2000   # 1実行あたりの明細行の上限（大規模な入れ替えで台帳が膨らむのを防ぐ）   #▲修正18
+def kT(bp):   # TSVのセルに入れられる形へ整形（タブ・改行を落とし、極端に長い行は切る）
+    bp=bp.replace(u"\t",u"    ").replace(u"\r",u"").replace(u"\n",u" ")
+    return bp if len(bp)<=1000 else bp[:1000]+u"…（以下略）"
+def kE(ay,bt):   # 前版と今版から (種別,旧行,新行,変更前,変更後) の一覧を作る
+    a1=ay.splitlines(); b1=bt.splitlines(); ct=[]
+    try:
+        for tg,i1,i2,j1,j2 in difflib.SequenceMatcher(None,a1,b1).get_opcodes():
+            if tg=="equal": continue
+            if tg=="replace":       # 置き換え＝変更前と変更後を1行に並べる
+                for db in range(max(i2-i1,j2-j1)):
+                    ct.append((u"変更",
+                        unicode(i1+db+1) if i1+db<i2 else u"",
+                        unicode(j1+db+1) if j1+db<j2 else u"",
+                        kT(a1[i1+db]) if i1+db<i2 else u"",
+                        kT(b1[j1+db]) if j1+db<j2 else u""))
+            elif tg=="delete":
+                for db in range(i1,i2): ct.append((u"削除",unicode(db+1),u"",kT(a1[db]),u""))
+            elif tg=="insert":
+                for db in range(j1,j2): ct.append((u"追加",u"",unicode(db+1),u"",kT(b1[db])))
+    except:      # difflibが無い環境: 行の増減だけを記録する（前後の対応づけはしない）
+        s1=set(a1); s2=set(b1); ct=[]
+        for db,du in enumerate(b1,1):
+            if du not in s1: ct.append((u"追加",u"",unicode(db),u"",kT(du)))
+        for db,du in enumerate(a1,1):
+            if du not in s2: ct.append((u"削除",unicode(db),u"",kT(du),u""))
+    if len(ct)>kM: ct=ct[:kM]+[(u"以降省略",u"",u"",u"",u"変更が%d行を超えたため省略。全文は latest_diff.txt を参照"%kM)]
+    return ct
+#===== ▲修正18 ここまで =====
 def kg(bp):   # 版数＝本文のSHA1先頭12桁
     try:
         ba=SHA1.Create().ComputeHash(Encoding.UTF8.GetBytes(bp))
@@ -476,20 +511,32 @@ def km():
     if ay is not None and kg(ay)==cc:
         print "コード履歴: 変更なし（版数 %s / 取得元 %s）"%(cc,bp)
         return u"版数 %s（前回から変更なし）"%cc,None
-    az=jd.ToString("yyyyMMdd_HHmmss"); ct=None
+    ct=None   #▲修正18: 版ごとのファイル名を作らなくなったので日時文字列(az)は不要になった
     if ay is not None: ct=kD(ay,bt,u"前回 %s"%kg(ay),u"今回 %s"%cc)
     cu=len([1 for du in (ct or u"").split(u"\n") if du[:1]==u"+" and du[:3]!=u"+++"])
     cw2=len([1 for du in (ct or u"").split(u"\n") if du[:1]==u"-" and du[:3]!=u"---"])
+#===== ▲修正18 ここから ===== 版ごとの.py複製と日時つきdiffをやめ、台帳2本＋上書き2本に集約
+#★旧|         File.WriteAllText(d(ba,u"code_%s_%s.py"%(az,cc)),bt,Encoding.UTF8)   # 版ごとの複製
+#★旧|         if ct: File.WriteAllText(d(ba,u"diff_%s.txt"%az),ct,Encoding.UTF8)   # 日時つきの差分
     try:
-        File.WriteAllText(d(ba,u"code_%s_%s.py"%(az,cc)),bt,Encoding.UTF8)
-        File.WriteAllText(bd,bt,Encoding.UTF8)
-        if ct: File.WriteAllText(d(ba,u"diff_%s.txt"%az),ct,Encoding.UTF8)
+        File.WriteAllText(bd,bt,Encoding.UTF8)                                    # 次回の比較の土台（毎回上書き）
+        if ct: File.WriteAllText(d(ba,u"latest_diff.txt"),ct,Encoding.UTF8)       # 直近の差分（毎回上書き）
         if not File.Exists(d(ba,u"code_history.tsv")):
             File.WriteAllText(d(ba,u"code_history.tsv"),u"日時\t版数\t前版数\t取得元\t行数\t追加\t削除\n",Encoding.UTF8)
         File.AppendAllText(d(ba,u"code_history.tsv"),u"%s\t%s\t%s\t%s\t%d\t%d\t%d\n"%(
             jd.ToString("yyyy-MM-dd HH:mm:ss"),cc,kg(ay) if ay is not None else u"-",bp,len(bt.splitlines()),cu,cw2),Encoding.UTF8)
+        if ay is not None:                                                        # 明細台帳＝変更前/変更後だけを追記
+            cy2=kE(ay,bt)
+            if cy2:
+                if not File.Exists(d(ba,u"code_changes.tsv")):
+                    File.WriteAllText(d(ba,u"code_changes.tsv"),u"日時\t版数\t前版数\t種別\t旧行\t新行\t変更前\t変更後\n",Encoding.UTF8)
+                az2=jd.ToString("yyyy-MM-dd HH:mm:ss"); ay2=kg(ay)
+                File.AppendAllText(d(ba,u"code_changes.tsv"),u"".join(
+                    u"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n"%((az2,cc,ay2)+ba2) for ba2 in cy2),Encoding.UTF8)
+                print "コード履歴: 変更行 %d 件を code_changes.tsv に記録"%len(cy2)
     except Exception,bb:
         print "WARN コード履歴の書き込みに失敗:",bb
+#===== ▲修正18 ここまで =====
     if ct:
         try: File.WriteAllText(d(at,u"code_diff.txt"),ct,Encoding.UTF8)   # 添付zipにも同梱
         except: pass
