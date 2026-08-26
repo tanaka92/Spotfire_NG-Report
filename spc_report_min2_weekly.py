@@ -58,6 +58,9 @@
 #     （code_changes.tsv）。履歴フォルダのファイルは4つ固定で増え続けない
 # 19  状態ファイルの圧縮をやめ、日時も項目名もそのまま書くV3形式に（見出し行つきタブ区切り）。
 #     毎回上書きの1ファイルなので容量の制約が無く、Excelでそのまま開いて中身を確認できる
+# 20  項目切替後の固定Sleepを廃止。参照(テーブル・カーソル・グラフ・トレリス頁)を毎回作り直し、
+#     判定列が2回続けて同じ内容になるまで待ってから集計する。○/×の推測読み替えをやめ、
+#     kO/kN で明示した値だけを数え、判定列の生値の分布を実行ログに出す
 # ================================================================================
 # SPC NG率レポート 自動配信（最短化版）。動作は spc_report_integrated.py と同一。
 #===== ★変更1 ここから ===== ヘッダの期間説明を新仕様(NG率8日/ルール30日/画像全期間)に差替
@@ -404,6 +407,19 @@ jb=True           # True=既報行を水位線で除外（推奨） / False=旧�
 ks=u""            # 例: ur"\\＜サーバ＞\＜共有＞\spc\spc_state.txt"   #▲修正13
 kt=180            # 状態の失効日数。この日数更新の無いkeyは保存時に捨てる（0で無効）   #▲修正13
 #===== ▲修正13 ここまで =====
+#===== ▲修正20 ここから ===== 判定値の解釈と、項目切替後の再計算待ち
+# 【なぜ必要か】項目切替(a[i]=ee)は計算列の再計算を起こす。固定Sleepだけで先へ進むと
+#   ・前の項目の判定値をそのまま読む（OK/NGの数が実態と合わない・項目により逆に見える）
+#   ・ノードが作り直されている最中に触る（Detachedエラーで項目が丸ごと欠落）
+#   ・落ちるかどうかがタイミング次第なので、同じデータでも実行のたびに結果が変わる
+#   が起きる。判定列の内容が2回続けて同じになるまで待ってから集計する。
+kO=[u"OK",u"ＯＫ"]        # OKとみなす判定値（前後空白を除き大文字化した後の値で比較）   #▲修正20
+kN=[u"NG",u"ＮＧ"]        # NGとみなす判定値。○/×などを使っている場合はここへ追加する   #▲修正20
+kW=12                     # 再計算待ちの最大回数   #▲修正20
+kP=400                    # 待ち1回あたり(ms)   #▲修正20
+kQ=3000                   # 落ち着いたかを判定するときの抜き取り行数（全走査を避けるため）   #▲修正20
+kV={}                     # 判定列の生値の分布（診断用）   #▲修正20
+#===== ▲修正20 ここまで =====
 #===== ▲追加16 ここから ===== コード履歴（実行のたびに版数を記録し、変わっていれば差分を出力）
 kh=u""            # 履歴の保存先フォルダ。空なら 出力ルート\code_history   #▲追加16
 kj=u""            # Spotfireに登録したスクリプト名（ScriptManager経由で本文を取る場合に指定）   #▲追加16
@@ -584,11 +600,43 @@ if not be:
 # │ bf=対象トレリスグラフ   bh=判定列  bi=装置ch列  bj=加工日時  bk=実測値  bl=中心線  bm=σ_LOT  bn=ロットID
 # │ カーソルはここで1回だけ作り、以降のGetRowsで使い回す
 # └──────────────────────────────────────────────────────────────────────────
-bf=[az.As[VisualContent]() for bg in Document.Pages for az in bg.Visuals if az.Title==j][0]
-bh=c[String](av.Columns[g]); bi=c[String](av.Columns[h])
-bj=c[DateTime](av.Columns[m])
-bk=c[Double](av.Columns[o]); bl=c[Double](av.Columns[p])
-bm=c[Double](av.Columns[q]); bn=c[String](av.Columns[r])
+#===== ▲修正20 ここから ===== 参照は使い回さず取り直せるようにする（Detached対策）
+def kf2():   # 対象グラフを取り直す。ノードが差し替わっても追随する   #▲修正20
+    for bg2 in Document.Pages:
+        for az2 in bg2.Visuals:
+            if az2.Title==j: return az2.As[VisualContent]()
+    return None
+def kj2():   # データテーブルと列カーソルを作り直す（項目切替のたびに呼ぶ）   #▲修正20
+    global av,bh,bi,bj,bk,bl,bm,bn,bf
+    av=b.Tables[f]
+    bh=c[String](av.Columns[g]); bi=c[String](av.Columns[h])
+    bj=c[DateTime](av.Columns[m])
+    bk=c[Double](av.Columns[o]); bl=c[Double](av.Columns[p])
+    bm=c[Double](av.Columns[q]); bn=c[String](av.Columns[r])
+    bf=kf2()
+def kb2(bd):   # 判定列の先頭bd行の要約(非null件数,NG件数)。再計算が落ち着いたかの判定に使う   #▲修正20
+    ct=0; cu2=0
+    for ei2 in av.GetRows(bh):
+        az2=bh.CurrentValue
+        if az2 not in (None,""):
+            cu2+=1
+            if unicode(az2).strip().upper() in kN: ct+=1
+        bd-=1
+        if bd<=0: break
+    return (cu2,ct)
+def kc3():   # 参照を作り直し、判定列が2回続けて同じ内容になるまで待つ。戻り値=(待った回数,要約)   #▲修正20
+    ay2=None
+    for db in range(kW):
+        try:
+            kj2(); e(kP); az2=kb2(kQ)
+        except Exception,bb:
+            if db<kW-1 and (u"Detached" in unicode(bb) or u"Disposed" in unicode(bb)): e(kP); continue
+            raise
+        if ay2 is not None and az2==ay2: return db+1,az2
+        ay2=az2
+    return kW,ay2
+#===== ▲修正20 ここまで =====
+kj2()
 
 # ┌─【区分】小道具（文字列とキーの操作） ──────────────────────────────────
 # │ bo()=HTMLエスケープ  bq()=ファイル名の禁止文字を置換  jv()=表記ゆれ吸収キー(空白/記号/大小文字を無視)
@@ -859,7 +907,14 @@ except: jq=None
 # └──────────────────────────────────────────────────────────────────────────
 for ee in be:
     try:
-        a[i]=ee; e(400)   # BUG?: Sleep短いと前項目値を読む
+#★旧|         a[i]=ee; e(400)   # BUG?: Sleep短いと前項目値を読む
+#===== ▲修正20 ここから ===== 固定Sleepをやめ、参照の作り直し＋再計算が落ち着くまで待つ
+        a[i]=ee
+        kz2,kx2=kc3()
+        print "DBG %s: 再計算待ち%d回 / 抜き取り%d行中 判定あり%d行(内NG%d)"%(
+            ee,kz2,kQ,(kx2 or (0,0))[0],(kx2 or (0,0))[1])
+        if kz2>=kW: print "WARN %s: 待ち上限%d回に達しました。判定列がまだ安定していない可能性があります"%(ee,kW)
+#===== ▲修正20 ここまで =====
         try: ef=a[k]
         except: ef=u"?"
         try: eg=a[l]
@@ -900,9 +955,14 @@ for ee in be:
 #===== ▲修正14 ここから ===== 判定値の読み取りを期間フィルタより前に出し、全期間の参考値を同じ1パスで取る
             az=bh.CurrentValue
             if az in (None,""): continue
+#★旧|             if   az in (u"NG",u"ＮＧ",u"×",u"NG判定"): az=u"NG"
+#★旧|             elif az in (u"OK",u"ＯＫ",u"○",u"◯",u"OK判定"): az=u"OK"
+#  ▲修正20: ○/×等の推測による読み替えをやめ、kO/kN で明示した値だけを数える。   #▲修正20
+#           生値の分布を記録して、実際にどんな値が入っているかを実行ログで確認できるようにする。
             az=unicode(az).strip().upper()              # 前後空白・大小文字の揺れを吸収   #▲修正5
-            if   az in (u"NG",u"ＮＧ",u"×",u"NG判定"): az=u"NG"
-            elif az in (u"OK",u"ＯＫ",u"○",u"◯",u"OK判定"): az=u"OK"
+            kV[az]=kV.get(az,0)+1                       # 生値の分布（診断用）   #▲修正20
+            if   az in kN: az=u"NG"
+            elif az in kO: az=u"OK"
             else: jj+=1; continue                       # OK/NGどちらでもない値は数えず件数だけ記録   #▲修正5
             ay=ka.get(eo)
             if ay is None: ay=[0,0]; ka[eo]=ay
@@ -1005,7 +1065,10 @@ for ee in be:
             try: jp=fi.ActivePageIndex   # 実行前のトレリス表示頁を退避
             except: jp=None
             for fk in range(fj):
+#★旧|                 fi.ActivePageIndex=fk; e(200)
+                fi=kf2().Trellis                      # 頁は再パネリングで作り直されるので毎回取り直す   #▲修正20
                 fi.ActivePageIndex=fk; e(200)
+                fi=kf2().Trellis                      # 切替後にもう一度（切替中のノードを読まない）   #▲修正20
                 try: js=unicode(fi.CurrentPage.Name)   # 実名が取れるならそれを最優先（並び順に依存しない）
                 except:
                     try: js=unicode(fi.Pages[fk].Name)
@@ -1026,15 +1089,21 @@ for ee in be:
                     if u";".join((ds.get(eo) or u"").split(u";")[:4])==dv.get(eo): ea+=1; continue   # 5番目以降(継続回数/水位線)は比較対象外   #★変更12
 #===== ★変更12 ここまで =====
                 fm=fl if fl is not None else u"page %d"%(fk+1)
+                ca=None; fn=None
                 try:   # 1chの失敗で残chを巻き込まない
+                    bf=kf2(); fi=bf.Trellis                    # 描画直前にも取り直す   #▲修正20
                     fi.ActivePageIndex=fk; e(900)   # BUG?: 待ち不足だと前ページの絵を撮る（ラベルと画像がズレる）
+                    bf=kf2()                                   #▲修正20
                     ca=Bitmap(w,x); fn=Graphics.FromImage(ca); fn.Clear(Color.White)   # BUG?: Clear無で余白黒
                     fn.TextRenderingHint=fn.TextRenderingHint.AntiAlias
                     bf.Render(fn,Rectangle(0,0,w,x))
                     fo=bq(u"%s__%s.jpg"%(ee,fm))
-                    ca.Save(d(au,fo),dp,dr); ca.Dispose(); fn.Dispose(); dz+=1
+                    ca.Save(d(au,fo),dp,dr); dz+=1
                 except Exception as bb:
                     dy.append(u"%s/%s(描画): %s"%(ee,fm,bb)); continue
+                finally:   # 例外時にGDI+ハンドルを解放しないと、ch数が多い実行で枯渇する   #▲修正20
+                    if fn is not None: fn.Dispose()
+                    if ca is not None: ca.Dispose()
                 if fl is not None:
                     eo=bz(ee,fl); fp=en.get(fl,0); fq=em.get(fl,0); fr=bv(fp,fq)
 #===== ▲修正9 ここから ===== 新規データが無いchのラベルを「OK 0・NG 0」ではなく明示表記に
@@ -1331,6 +1400,14 @@ print "画像未取得ch=%d件"%len(jw)
 print "DBG 既報スキップ=%d行 / 移行窓スキップ=%d行 / 未知判定値=%d行"%(jr["skip"],jr["old"],jr["unk"])   #▲修正10
 print "DBG 水位線を更新したkey=%d件（次回はこの加工日時より後の行だけを集計）"%len(jm)   #▲修正10
 if jr["unk"]: print "WARN 判定列にOK/NG以外の値が%d行あります（列指定または表記の確認を推奨）"%jr["unk"]   #▲修正10
+#===== ▲修正20 ここから ===== 判定列に実際どんな値が入っていたかを出す（OK/NGの取り違えを目で確認できる）
+if kV:
+    print "DBG 判定列の値の分布（前後空白を除き大文字化した後の値・多い順）:"
+    for az,bd in sorted(kV.items(),key=lambda ba:-ba[1])[:10]:
+        print "      %s : %d行 → %s"%(repr(az),bd,u"NGとして計上" if az in kN else (u"OKとして計上" if az in kO else u"未計上"))
+    if len([1 for az in kV if az not in kN and az not in kO]):
+        print "      ※「未計上」の値を数えたい場合は、設定の kO / kN にその値を追加してください"
+#===== ▲修正20 ここまで =====
 #===== ▲修正10 ここまで =====
 #===== ★追加23 ここから ===== 診断print(窓内点数の分布・ゲート未達件数・各ルールの点数到達率)
 if ii:   #★追加23
